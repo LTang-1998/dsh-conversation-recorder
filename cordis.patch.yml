@@ -1,0 +1,7 @@
+# dsh-conversation-recorder 插件层：把新会话实时记录成 _conversations 下的可读 md 链。
+# 插件行 name 用**包名**（不是相对源码路径）：Node 的模块解析靠这么写才能从 node_modules 找到
+# 已安装的代码，见 https://github.com/LTang-1998/dsh-conversation-recorder 的 README「安装」。
+# 入口由 package.json 的 main/exports 指向预构建的 lib/index.js。
+- insert:
+    - id: dsh-conversation-recorder
+      name: dsh-conversation-recorder

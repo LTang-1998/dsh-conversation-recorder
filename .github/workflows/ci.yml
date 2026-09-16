@@ -1,0 +1,58 @@
+# 发布一致性门禁：node 22 与 node 24 各跑一遍（SPEC §11）。
+#
+# 八个判据：两个类型门禁、验收测试、SPEC 结构自检、两个只读探针、产物一致性（pnpm verify）、
+# 隐私门禁（pnpm verify:privacy）。任何一条红都算失败。
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.19.0', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      # 两个宿主 peer（@deepseek-ai/schemastery / @deepseek-ai/dsh-home-paths）按 peerDependencies
+      # 声明、同时钉版本列在 devDependencies（见 SPEC §9），因此普通 install 就能在 CI 里解析它们
+      # ——测试用 node 直接跑 .ts 并 import 这两个包，类型门禁也要它们的 .d.ts。
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (host)
+        run: pnpm typecheck
+
+      - name: Typecheck (client)
+        run: pnpm typecheck:client
+
+      - name: Acceptance tests
+        run: pnpm test
+
+      - name: SPEC self-check
+        run: node tests/spec-selfcheck.ts
+
+      - name: Read-only probes
+        run: |
+          node tests/probe-real-settings.ts
+          node tests/probe-client-bundle.ts
+
+      - name: Build artifacts consistent with src
+        run: pnpm verify
+
+      - name: Privacy gate
+        run: pnpm verify:privacy

@@ -1,0 +1,10 @@
+node_modules/
+lib/*.tsbuildinfo
+*.tsbuildinfo
+.ds_store
+.client-build-tmp/
+
+# 内部过程文档：只在本地保留，不入公开仓库、不进 npm 包
+PROGRESS.md
+BLOCKED.md
+CHANGELOG.md

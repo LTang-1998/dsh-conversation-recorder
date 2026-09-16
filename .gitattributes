@@ -1,0 +1,13 @@
+# 统一换行符：源码与构建产物一律 LF。
+#
+# 为什么必须钉住：`pnpm build` 直出的 `lib/*.js` 是 LF，而 Windows 上 checkout 默认可能被
+# 转成 CRLF（core.autocrlf）——两者内容一致却让 `git status` 报「已修改」，
+# `pnpm verify` 的 `git diff --exit-code -- lib` 就会误报。产物与源码必须**逐字节**可比。
+* text=auto eol=lf
+
+# 二进制/无需归一化的
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
