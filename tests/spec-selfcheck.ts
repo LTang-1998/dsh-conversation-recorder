@@ -56,7 +56,7 @@ for (const f of ['session', 'seq', 'time', 'kind', 'prev']) {
   must(f, `轮次 frontmatter 字段 ${f}`)
 }
 must('callId', 'callId 内联引用')
-must('message.source.callId', 'callId 取自 tool/result 的 message.source.callId')
+must('message.toolCallId ?? message.source.callId', 'callId 取自 tool/result 的 toolCallId ?? source.callId（v4 形状）')
 
 // 已删除字段的负向检查（判据同步且更严）
 forbid('| summary |', '轮次表 summary 列')
@@ -94,16 +94,24 @@ must('（无用户文本）', '无用户文本占位语义')
 // 配置节
 must('## 8. 配置', '配置节')
 must('root', 'root 配置项')
-must('conversation-recorder', '设置命名空间 conversation-recorder')
+must('dsh-conversation-recorder', '设置命名空间 dsh-conversation-recorder')
 
-// 2026-09-15 任务1：根解析顺序（设置 → 配置 → 内置 $DSH_HOME/_conversations）与四个设置字段
+// 2026-10-19：0.2.1 的 Config 模型（旧「设置注册 + 三层解析」已删）
 must('根解析顺序', '根解析顺序小节')
-// 内置默认根：**按行**核对「有序三层」与默认根字面量，避免别处出现同一字面量时漏检
-// （自检判据在 2026-09-15 加严：原先只要 SPEC 任意处含该字面量即算命中，改坏 §2 的一处不会变红）
-mustLine('[根解析顺序]', '根解析顺序小节', /^[1-3]\. .*root.*$/)
+// 内置默认根：**按行**核对「Config 一层 + 内置默认」两层，避免别处出现同一字面量时漏检
+mustLine('[根解析顺序]', '根解析顺序小节', /^1\. 插件 `Config` 的 `root`/)
 mustLine('[内置默认根]', '内置默认根 $DSH_HOME/_conversations', /^3\. 内置默认 `\$DSH_HOME\/_conversations`/)
 must('resolveDshHome()', '默认根按 resolveDshHome() 语义解析')
-must("applies: 'live'", '注册声明 applies: live（改完即时生效）')
+must('config.root.get()', 'root 从 Config 的 getter 读')
+must('`Config`', '插件导出 Config')
+must('.volatile()', '五个字段都用 .volatile()（稳定引用）')
+must("settings.configure({ auto: false }", 'apply 用 settings.configure({auto:false}) 接线')
+must('configForms', '客户端用 configForms 服务')
+must('ctx.configForms.get', '客户端按条目 id 取 ConfigForm')
+must('form.set(field, value)', '客户端逐字段 form.set 写入')
+forbid("applies: 'live'", '旧的 applies: live 注册模型')
+forbid('remote.settings', '旧的 remote.settings 通道')
+forbid('remote-envelope', '旧的 remote-envelope 解包模块')
 must('不用重启', '改设置即时生效、不用重启')
 for (const f of ['recordSubagents', 'toolArgsPreview', 'emptyIndex']) {
   must(f, `设置字段 ${f}`)
@@ -150,7 +158,7 @@ must('- [', '工具清单行前缀')
 must('前40', '参数前 40 字')
 must('结果', '结果行数')
 must('[error:', 'error code')
-must('message.content[0].content', '结果文本解包路径')
+must("type === 'text'", '结果文本取 content 里的 text 块（v4 无 tool-result 包壳）')
 
 // 契约字段表区块标记（只在独立行取，避免文中内联代码里的同名标记干扰）
 const begin = spec.indexOf('\n<!-- CONTRACT-FIELDS-BEGIN -->')

@@ -33,7 +33,7 @@ dsh plugin --profile <你的 profile> add github:LTang-1998/dsh-conversation-rec
 
 ## 兼容性
 
-- **DSH**：针对 **0.1.5-rc.1** 开发与验证，**未在其他版本上验证过**。它绑定这些宿主内部契约，升级 DSH 时请留意：会话事件 `session/created`/`session/event`/`session/disposed` 及载荷形状；`tool/result` 的 `message.source.callId` 与 `content[0].content`；设置服务注册时「把 schema 当函数调用」的语义；客户端 `settings.section` 槽与 `remote.settings` 的 `{ok,value}` 信封。
+- **DSH**：针对 **0.2.1-rc.2** 开发与验证（`engines.dsh: ^0.2.1-rc.2`），**未在其他版本上验证过**。它绑定这些宿主内部契约，升级 DSH 时请留意：会话事件 `session/created`/`session/event`/`session/disposed` 及载荷形状；`tool/result` 的 `message.toolCallId ?? message.source.callId` 与消息 content 里的 text 块（v4 无 `tool-result` 包壳）；插件 `Config` + `.volatile()` 的 `config.<field>.get()` 读取模型与 `settings.configure({auto:false})` 接线；客户端 `settings.section` 槽与 `configForms` 的 `getSnapshot`/`subscribe`/`set`。
 
 ## 它记什么
 
@@ -58,20 +58,20 @@ dsh plugin --profile <你的 profile> add github:LTang-1998/dsh-conversation-rec
 
 ## 设置
 
-命名空间 `conversation-recorder`，注册为 `applies: 'live'`——**改完即时生效，不用重启**。
-两种改法：DSH 设置页的「会话记录」分区，或直接写 `<$DSH_HOME>/settings.yaml`：
+命名空间 `dsh-conversation-recorder`（= profile 里的插件条目 id）。插件 `export const Config`，五个字段
+全部 `.volatile()`——宿主每次读取都是当前值，所以**改完即时生效，不用重启**。
+两种改法：DSH 设置页的「会话记录」分区，或写 profile 的 `cordis.patch.yml` 里本插件条目的 `config`：
 
 ```yaml
-conversation-recorder:
-  enabled: true
-  root: <工作区>\_conversations
-  toolArgsPreview: 60
+- id: dsh-conversation-recorder
+  config:
+    root: D:\知识库\_conversations
 ```
 
 | 字段 | 类型 | 默认值 | 说明 |
 | ---- | ---- | ------ | ---- |
 | `enabled` | boolean | `true` | **总开关**。关掉后立即停止产出新文件：不落盘、不补写 index、连目录都不建；进行中的那一轮整轮丢弃（不留半份、不占序号）；**不删任何已有内容**。改回 `true` 后下一次轮次事件立即恢复 |
-| `root` | string | `<$DSH_HOME>/_conversations` | 记录根；三层优先：**设置 → 装配配置 → 内置默认**。支持开头 `~` 展开 |
+| `root` | string | `<$DSH_HOME>/_conversations` | 记录根；**唯一来源就是 `Config.root`**（空串回退内置默认）。支持开头 `~` 展开 |
 | `recordSubagents` | boolean | `false` | 打开后子代理会话（`header.origin === 'subagent'`）也记录 |
 | `toolArgsPreview` | number | `40` | 工具清单行参数预览字数（0–200，越界由 schema 拒绝） |
 | `emptyIndex` | boolean | `false` | 打开后元数据事件（`session/title` / `request/context`）也建目录并写 index；默认只有首个内容轮次落盘才建目录（不产生空壳） |
@@ -117,7 +117,7 @@ pnpm verify:privacy    # 全仓扫机器特定路径（盘符用户目录 / POSI
 ```
 node tests/run.ts                       # 验收测试：通过 64 / 失败 0 / 跳过 0
 node tests/spec-selfcheck.ts            # SPEC 结构自检（绿）
-node tests/probe-real-settings.ts       # 只读探针：真实 settings.yaml → 三层解析 → 落点
+node tests/probe-real-settings.ts       # 只读探针：本机声明的 root → Config → 落点
 node tests/probe-client-bundle.ts       # 只读探针：lib/client.js 自注册/物化/槽注册链
 ```
 
@@ -155,10 +155,9 @@ CI 按 **node 22 与 node 24** 各跑一遍上面的门禁（`.github/workflows/
 （`--dsw-alias-*`），**没有裸 `<input>`/`<button>`/`<label>`**；**不给 `Input` 传 `style`**（官方
 `Input` 的 `style` 会打进内层内容层，外框里套小框、两个框大小不一致）。
 
-读写走宿主 settings Remote（`describe` / `mutate`，与官方设置页同一条通道，只发改动过的字段）。
-两个返回值都是**信封**（`{ok:true,value}` / `{ok:false,error}`），读/写都必须先过
-`src/client/remote-envelope.ts` 的 `unwrapRemoteEnvelope()`（裸载荷直接报错，不许静默当 value）；
-保存成功后**回读真 revision 与真值**，绝不本地自增猜版本号。读/写失败显示在分区状态行；
+读写走宿主 `configForms` 服务：`ctx.configForms.get('dsh-conversation-recorder')` 取 `ConfigForm`，
+读用 `getSnapshot()`/`subscribe()`，写逐字段 `await form.set(field, value)`——revision 校验、失败回读、
+写入排队都由宿主负责，客户端不再自己解信封、也不自增版本号。读/写失败显示在分区状态行；
 客户端半边挂载失败不影响宿主记录（`apply()` 包 try/catch）。
 
 ## 契约摘要
@@ -193,11 +192,11 @@ CI 按 **node 22 与 node 24** 各跑一遍上面的门禁（`.github/workflows/
 │   └── check-privacy.ts # 隐私门禁（本机路径 / 真实会话 id）
 ├── lib/                 # 预构建产物（**提交进 git**，安装时加载的就是它）
 │   ├── index.js         #   入口：export paths/format/seq/docs/settings/engine + name + inject
-│   ├── paths.js         #   三层 root 解析 / workspaceDir / safeSessionDir / seqFile / UTC 时间
+│   ├── paths.js         #   root 解析 / workspaceDir / safeSessionDir / seqFile / UTC 时间
 │   ├── format.js        #   frontmatter、三列轮次表、正文渲染与回填读取
 │   ├── seq.js           #   序号规则纯函数 nextSeq（磁盘最大序号 + 1）
 │   ├── docs.js          #   记录根下的 README.md / AGENTS.md（只缺则写）
-│   ├── settings.js      #   设置命名空间、五字段默认值与 schema、三层来源解析
+│   ├── settings.js      #   Config（五字段 volatile）、命名空间、内置默认根
 │   ├── engine.js        #   事件引擎 + apply(ctx, config) 接线
 │   ├── client.js        #   客户端半边（浏览器 bundle，设置页分区）
 │   └── *.d.ts           #   对应类型声明
@@ -206,7 +205,7 @@ CI 按 **node 22 与 node 24** 各跑一遍上面的门禁（`.github/workflows/
 └── tests/
     ├── run.ts               # 验收测试（node 直接跑）
     ├── spec-selfcheck.ts    # SPEC 结构自检
-    ├── probe-real-settings.ts   # 只读探针：真实 settings.yaml → 三层解析 → 落点
+    ├── probe-real-settings.ts   # 只读探针：本机声明的 root → Config → 落点
     ├── probe-client-bundle.ts   # 只读探针：lib/client.js 自注册/物化/槽注册链
     ├── client-bundle.ts     # 上面那个探针的加载链替身（真代码，可复用）
     └── .gitignore           # 忽略 .tmp/

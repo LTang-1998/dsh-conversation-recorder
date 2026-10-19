@@ -10,8 +10,7 @@
  * 全仓库唯一放行的两个裸包名（`schemastery`/`dsh-home-paths`）在 `settings.ts`，见 SPEC §9。
  */
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
-import type { RecorderConfig } from './paths.js';
-import type { SettingsProviderLike, SettingsSource } from './settings.js';
+import type { RecorderConfig } from './settings.js';
 /** 会话对象里本引擎真正用到的部分（测试用合成对象驱动，不要求完整 Session）。 */
 export interface SessionLike {
     readonly id: string;
@@ -23,13 +22,12 @@ export interface SessionLike {
     };
 }
 /**
- * 记录引擎。五个设置（enabled/root/recordSubagents/toolArgsPreview/emptyIndex）由
- * `SettingsSource` 在每次读取时解析：设置 → 配置 → 内置默认（见 SPEC §8）。
+ * 记录引擎。五个设置由 `Config` 的 `.volatile()` 字段提供（`config.<field>.get()`，
+ * 每个事件重读，不缓存；设置页写入后立刻生效，见 SPEC §8）。
  */
 export declare class RecorderEngine {
-    /** 装配配置里的 root（设置缺席时的第二层）。 */
-    private readonly configRoot;
-    private readonly settings;
+    /** 宿主传进来的 Config 实例（五个字段都是稳定引用）。 */
+    private readonly config;
     private readonly sessions;
     /**
      * 本进程见过的会话 header（来自 `session/created`）。只用于「后续事件载荷没带 header」时补档：
@@ -38,10 +36,10 @@ export declare class RecorderEngine {
     private readonly headers;
     /** 已 `session/disposed` 的会话 id：headerless 的后续事件不得靠补档把它们重新建档。 */
     private readonly disposed;
-    constructor(config?: RecorderConfig, settings?: SettingsSource);
+    constructor(config?: RecorderConfig);
     /** 当前设置快照（每次读都重算，改完即时生效）。 */
     private current;
-    /** 记录根：设置 root → 配置 root → 内置 `<$DSH_HOME>/_conversations`。 */
+    /** 记录根：Config 的 root → 内置 `<$DSH_HOME>/_conversations`。 */
     private recorderRoot;
     /**
      * 会话目录重解析：设置里的 root 改了（live）后，后续轮次立刻落到新根下。
@@ -98,8 +96,9 @@ export declare class RecorderEngine {
     private onUserMessage;
     private onToolCall;
     /**
-     * tool/result：callId 取自 `message.source.callId`（与 tool/call 配对），
-     * 结果文本解包 `message.content[0].content`，错误码取 `error?.code`。
+     * tool/result：callId 取 `message.toolCallId ?? message.source.callId`（0.2.1 的 v4
+     * 载荷把 callId 放在消息顶层，旧载荷在 source 里），结果文本直接取消息 content 的
+     * text 块（v4 去掉了旧的 `type:'tool-result'` 包壳），错误码取 `error?.code`。
      * 没有配对 tool/call 的结果不出行（不捏造）；结构异常（无 callId）直接跳过。
      */
     private onToolResult;
@@ -146,15 +145,30 @@ export declare class RecorderEngine {
      */
     private writeIndex;
 }
-/** 本插件用到的 ctx.on 重载与可选的 settings 服务（不引入 cordis 运行时/类型依赖）。 */
+/** 本插件用到的 ctx 面（不引入 cordis 运行时/类型依赖，结构兼容即可）。 */
 export interface PluginCtx {
     on(event: 'session/created', listener: (session: Session) => void): unknown;
     on(event: 'session/disposed', listener: (session: Session) => void): unknown;
     on(event: 'session/event', listener: (session: Session, event: SessionEvent) => void): unknown;
-    /** 设置服务；插件声明 `inject: ['settings']`，未挂载时缺席。 */
-    settings?: SettingsProviderLike;
+    /** 运行时注入 settings 服务（0.2.1 的配置模型：插件自己 export Config）。 */
+    inject(names: readonly string[], callback: (child: PluginChildCtx) => void): unknown;
+    /** 插件 fiber：`settings.configure` 的 owner（与宿主官方插件同一写法）。 */
+    readonly fiber: unknown;
 }
-/** 插件静态声明：告诉 cordis 本插件需要 settings 服务（缺席也能加载）。 */
-export declare const inject: readonly ["settings"];
-/** 接线薄壳：把 ctx 事件接到引擎上；`config` 作为设置的第二层接进引擎。 */
+/** `ctx.inject(['settings'], child => …)` 里的子上下文。 */
+export interface PluginChildCtx {
+    effect(callback: () => () => void): unknown;
+    settings: {
+        configure(presentation: {
+            readonly auto?: boolean;
+        }, owner?: unknown): () => void;
+    };
+}
+/**
+ * 接线薄壳：把 ctx 事件接到引擎上；`config` 是宿主按 `Config` 解析出的实例
+ * （五个字段都是 `.volatile()` 稳定引用，引擎每次事件重读，设置改了立刻生效）。
+ *
+ * `settings.configure({ auto: false }, ctx.fiber)`：本插件自带设置分区（客户端
+ * `configForms`），告诉宿主不要再自动生成一张设置页。
+ */
 export declare function apply(ctx: PluginCtx, config?: RecorderConfig): void;

@@ -21,19 +21,19 @@
 
 import assert from 'node:assert/strict'
 import * as fs from 'node:fs'
-import { homedir } from 'node:os'
+import * as os from 'node:os'
 import * as path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { CONVERSATIONS_DIR, DEFAULT_TOOL_ARGS_PREVIEW, MAX_TOOL_ARGS_PREVIEW, RecorderEngine, RecorderSettingsSchema, apply, createSettingsSource, defaultRoot, ensureRootDocs, entrySettings, isoFromEpochMs, nextSeq, safeSessionDir, workspaceDir } from '../src/index.ts'
+import { CONVERSATIONS_DIR, Config, DEFAULT_TOOL_ARGS_PREVIEW, MAX_TOOL_ARGS_PREVIEW, RecorderEngine, apply, defaultRoot, ensureRootDocs, isoFromEpochMs, nextSeq, safeSessionDir, settingsOf, workspaceDir } from '../src/index.ts'
+import type { RecorderConfig } from '../src/index.ts'
 import { probeClientBundle } from './client-bundle.ts'
-import { loadSettings, saveSettings, unwrapRemoteEnvelope } from '../src/client/remote-envelope.ts'
 import z from '@deepseek-ai/schemastery'
 
-/** 测试沙箱目录（tests/.tmp，已 gitignore）。 */
-const TMP = path.join(path.dirname(fileURLToPath(import.meta.url)), '.tmp')
+/** 测试沙箱目录：系统临时目录（不落在仓库里；可用 DSH_RECORDER_TEST_TMP 覆盖）。 */
+const TMP = process.env.DSH_RECORDER_TEST_TMP ?? path.join(os.tmpdir(), 'dsh-conversation-recorder-tests')
 
 /**
  * 会话记录目录：`<root>/<工作区文件夹>/<sessionId>`（SPEC §2 分区布局）。
@@ -62,8 +62,8 @@ function rootDirs(root: string): string[] {
 /** 会话日志夹具（字段名与嵌套结构与真实事件逐字一致；文本为同形状中性示例）。 */
 const REAL_USER_MESSAGE = String.raw`{"type":"user/message","seq":8,"time":1788887977498,"data":{"content":[{"type":"text","text":"示例提问：这个工作区里有哪些文件？"}],"source":{"kind":"user","rpcId":"c05a7028-c56c-4877-9a20-c334e0a84804","clientTimeZone":"Asia/Shanghai"},"role":"user","id":"5865145f-3126-4887-a3d2-4b18effc0834"},"surfaceOp":"append"}`
 
-/** 会话日志夹具：tool/result，文本解包路径的现场证据（形状逐字，文本中性）。 */
-const REAL_TOOL_RESULT_GLOB = String.raw`{"type":"tool/result","seq":42,"time":1788888000080,"data":{"turn":1,"step":4,"message":{"source":{"kind":"tool","callId":"call_01_rc5rBvWq9jgWdHPDsP2X9191"},"content":[{"type":"tool-result","toolCallId":"call_01_rc5rBvWq9jgWdHPDsP2X9191","content":[{"type":"text","text":"No files found"}],"isError":false}],"role":"user","id":"8178309f-a5cc-4c0f-b74a-ee527d8f4738"},"meta":{"shape":"paths","paths":[],"truncated":false,"total":0}},"sourceEventSeqs":[41],"surfaceOp":"append"}`
+/** 会话日志夹具：tool/result（0.2.1 的 v4 形状：callId 在消息顶层，content 直接是 text 块）。 */
+const REAL_TOOL_RESULT_GLOB = String.raw`{"type":"tool/result","seq":42,"time":1788888000080,"data":{"turn":1,"step":4,"message":{"role":"tool","toolCallId":"call_01_rc5rBvWq9jgWdHPDsP2X9191","source":{"kind":"tool","callId":"call_01_rc5rBvWq9jgWdHPDsP2X9191"},"content":[{"type":"text","text":"No files found"}],"id":"8178309f-a5cc-4c0f-b74a-ee527d8f4738"}},"sourceEventSeqs":[41],"surfaceOp":"append"}`
 
 /** 会话日志夹具：与上面结果配对的 tool/call（seq=41）；形状逐字，参数为中性示例路径。 */
 const REAL_TOOL_CALL_GLOB = String.raw`{"type":"tool/call","seq":41,"time":1788887999439,"data":{"turn":1,"step":4,"callId":"call_01_rc5rBvWq9jgWdHPDsP2X9191","name":"glob","arguments":"{\"path\": \"C:\\\\workspace\", \"pattern\": \"node_modules/.bin/dsh*\"}"}}`
@@ -169,16 +169,14 @@ function toolResultEvent(seq: number, callId: string, text: string, errorCode?: 
   const data: Record<string, unknown> = {
     turn: 1,
     step: 1,
+    // 0.2.1 的 v4 形状：role=tool，callId 在消息顶层（source.callId 仍在，作为旧载荷兼容位）
     message: {
-      role: 'user',
+      role: 'tool',
       id: `tool-${seq}`,
+      toolCallId: callId,
       source: { kind: 'tool', callId },
-      content: [{
-        type: 'tool-result',
-        toolCallId: callId,
-        content: [{ type: 'text', text }],
-        isError: errorCode !== undefined,
-      }],
+      content: [{ type: 'text', text }],
+      isError: errorCode !== undefined,
     },
   }
   if (errorCode !== undefined) data.error = { name: 'ToolError', code: errorCode }
@@ -357,7 +355,7 @@ test('R9: 运行时依赖红线（拆模块后）：src/*.ts 运行时只 import
 // ---- 场景A：全流程（普通会话 2 轮 + title/model，无 ended/state） ----
 test('A: 全流程合成事件 → 文件与契约字段逐一断言', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'alpha'
 
   // session/created（origin 未设置 = 顶层会话）→ 仅记内存，懒建（任务3）：不建目录、不写 index
@@ -439,7 +437,7 @@ test('A: 全流程合成事件 → 文件与契约字段逐一断言', () => {
 
 test('A2: title/model 同步更新', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'beta'
   engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
   const dir = sessionDir(root, TMP, sid)
@@ -472,7 +470,7 @@ test('A2: title/model 同步更新', () => {
 // ---- 场景B：subagent 过滤 ----
 test('B: 子代理（origin=subagent）不记录', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   engine.onSessionCreated({ id: 'sub1', header: { origin: 'subagent', cwd: TMP, createdAt: 1700000000000 } })
   const dir = sessionDir(root, TMP, 'sub1')
   assert(!fs.existsSync(dir), 'subagent 不应建目录')
@@ -489,7 +487,7 @@ test('B: 子代理（origin=subagent）不记录', () => {
 // header.parentSession（DSH 对 seed fork 的持久化血缘）。断言逐字未改。
 test('C: fork 分支（父已记录 4 轮）子绝对 turn=5 起 → seq=turn−F=0001，prev 指向父目录 0004', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
 
   // 父会话：先记录 4 轮（turn 1..4）
   const parent = 'parent-s1'
@@ -534,7 +532,7 @@ test('C: fork 分支（父已记录 4 轮）子绝对 turn=5 起 → seq=turn−
 // ---- 场景C2（回归）：@引用路径（无 header.parentSession）→ 父未记录，seq 仍从 1 起连续 ----
 test('C2: 父未记录（F=0）→ fork 子会话 seq 从 1 起连续（回归）', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
 
   const ghost = 'ghost-parent' // 从未被本插件记录 → 无 index.md
   const child = 'child-s2'
@@ -558,7 +556,7 @@ test('C2: 父未记录（F=0）→ fork 子会话 seq 从 1 起连续（回归�
 // ---- 场景F（任务3）：懒建目录 ----
 test('F: 懒建目录（任务3）：仅 session/created 不建目录，首个轮次 turn/end 才建', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'lazy'
   engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
   const dir = sessionDir(root, TMP, sid)
@@ -589,7 +587,7 @@ test('F: 懒建目录（任务3）：仅 session/created 不建目录，首个�
  */
 test('D: 已有文件永不覆写——落盘序号避开磁盘上已存在的号，外部放置的文件一字不动', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'gamma'
   const dir = sessionDir(root, TMP, sid)
   const turnsDir = path.join(dir, 'turns')
@@ -657,7 +655,7 @@ test('D: 已有文件永不覆写——落盘序号避开磁盘上已存在的�
 // ---- 场景E：模型留空与填充 ----
 test('E: 无 request/context 事件时 model 留空', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   engine.onSessionCreated({ id: 'eta', header: { cwd: TMP, createdAt: 1700000000000 } })
   engine.onSessionEvent({ id: 'eta' }, turnStartEvent(1, 1))
   engine.onSessionEvent({ id: 'eta' }, userMsgEvent(2, 'x', 1))
@@ -671,7 +669,7 @@ test('E: 无 request/context 事件时 model 留空', () => {
 // ---- R1（修复1）：真实日志夹具驱动——tool/result 的 callId 与文本解包 ----
 test('R1: 真实日志夹具（seq 8/41/42 逐字）→ 用户行与工具行逐字正确', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'real-log'
   engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1788887950260 } })
   engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
@@ -698,10 +696,11 @@ test('R1: 真实日志夹具（seq 8/41/42 逐字）→ 用户行与工具行逐
   const body2 = fs.readFileSync(path.join(sessionDir(root, TMP, sid), 'turns', '0002.md'), 'utf8')
   assert(body2.includes('- [call_01_rc5r] glob {"pattern":"*.md"} → 结果3行'), '多行结果的行数统计错误')
 
-  // 没有配对 tool/call 的结果不出行（不捏造）
+  // 没有配对 tool/call 的结果不出行（不捏造）；assistant 文本让这一轮有内容（空轮次不落盘）
   engine.onSessionEvent({ id: sid }, turnStartEvent(15, 3))
-  engine.onSessionEvent({ id: sid }, toolResultEvent(16, 'call_orphan0000000000', '孤儿结果'))
-  engine.onSessionEvent({ id: sid }, turnEndEvent(17, 3))
+  engine.onSessionEvent({ id: sid }, assistantMsgEvent(16, '这一轮只有工具结果和助手回复', 3))
+  engine.onSessionEvent({ id: sid }, toolResultEvent(17, 'call_orphan0000000000', '孤儿结果'))
+  engine.onSessionEvent({ id: sid }, turnEndEvent(18, 3))
   const body3 = fs.readFileSync(path.join(sessionDir(root, TMP, sid), 'turns', '0003.md'), 'utf8')
   assert(!body3.includes('call_orphan00'), '没有配对 tool/call 的结果不应出工具行')
   assert(body3.includes('（无用户文本）'), '该轮无 user/agent-message 文本时应写占位行')
@@ -714,7 +713,7 @@ test('R2: resume 自愈：重启后从 index.md + turns/ 回填，title/model/tu
   const indexFile = path.join(sessionDir(root, TMP, sid), 'index.md')
 
   // 重启前：标题 + model + 2 轮
-  const before = new RecorderEngine({ root })
+  const before = new RecorderEngine(Config({ root }))
   before.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
   before.onSessionEvent({ id: sid }, titleEvent(1, '重启前的标题'))
   before.onSessionEvent({ id: sid }, contextEvent(2, 'deepseek-v4-flash'))
@@ -727,7 +726,7 @@ test('R2: resume 自愈：重启后从 index.md + turns/ 回填，title/model/tu
   assert.strictEqual(indexField(indexFile, 'turns'), '2', '重启前 turns')
 
   // 模拟进程重启：全新引擎（内存记录为空），同一 root
-  const after = new RecorderEngine({ root })
+  const after = new RecorderEngine(Config({ root }))
   after.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
   // 重启后先到的是 model 事件——旧实现会在此时用空 title/turns=0 覆盖 index
   after.onSessionEvent({ id: sid }, contextEvent(20, 'deepseek-v4-flash'))
@@ -748,7 +747,7 @@ test('R2: resume 自愈：重启后从 index.md + turns/ 回填，title/model/tu
 // ---- R3（修复3）：真 seed fork 基点 + 「被跳过的轮次之后继续仍只会向前写」 ----
 test('R3: 真 seed fork 基点=首个 turn/start−1（只用于 prev）；被跳过的轮次之后继续仍只会向前写 seq；重启续跑基点正确', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const parent = 'seed-parent'
   engine.onSessionCreated({ id: parent, header: { cwd: TMP, createdAt: 1700000000000 } })
   for (let t = 1; t <= 3; t += 1) {
@@ -791,7 +790,7 @@ test('R3: 真 seed fork 基点=首个 turn/start−1（只用于 prev）；被�
   assert.strictEqual(turnField(childTurn3, 'prev'), 'turns/0002.md', 'prev 指向磁盘上更小的最大序号 0002')
 
   // 重启续跑：新引擎 + 同一 root + 仍有 parentSession → seq 接着磁盘最大序号（0003）走 → 0004.md
-  const restarted = new RecorderEngine({ root })
+  const restarted = new RecorderEngine(Config({ root }))
   restarted.onSessionCreated({ id: child, header: { cwd: TMP, createdAt: 1700000000000, parentSession: parent } })
   restarted.onSessionEvent({ id: child }, turnStartEvent(10, 5))
   restarted.onSessionEvent({ id: child }, userMsgEvent(11, '重启后子第 4 轮', 5))
@@ -805,7 +804,7 @@ test('R3: 真 seed fork 基点=首个 turn/start−1（只用于 prev）；被�
 // ---- R4（修复4）：写盘失败 stderr + 丢弃该轮 ----
 test('R4: 写盘失败（turn 与 mkdir）→ stderr 警告 + 丢弃该轮，不抛异常', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'io-fail'
   engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
   engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
@@ -849,7 +848,7 @@ test('R5: safeSessionDir 拒绝 ""/"."/".."；引擎对不安全 id 不产出任
   assert.strictEqual(safeSessionDir('a/b\\c:d*e'), 'a_b_c_d_e', '不安全字符应替换为 _')
 
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const err = captureStderr(() => {
     for (const bad of ['.', '..', '']) {
       engine.onSessionCreated({ id: bad, header: { cwd: TMP, createdAt: 1700000000000 } })
@@ -867,7 +866,7 @@ test('R5: safeSessionDir 拒绝 ""/"."/".."；引擎对不安全 id 不产出任
 // ---- R6（修复6）：session/disposed 回收内存记录 ----
 test('R6: session/disposed 回收内存记录，其后事件不再写文件', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'dispose-me'
   const header = { cwd: TMP, createdAt: 1700000000000 }
   engine.onSessionCreated({ id: sid, header })
@@ -895,7 +894,7 @@ test('R6: session/disposed 回收内存记录，其后事件不再写文件', ()
 // ---- R7（修复7）：## user 收录 user + agent-message ----
 test('R7: ## user 只收 user + agent-message；plugin/skill-catalog 不收；都没有则写占位', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'user-scope'
   engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
   engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
@@ -911,10 +910,11 @@ test('R7: ## user 只收 user + agent-message；plugin/skill-catalog 不收；�
   assert(!userSection.includes('插件注入的上下文'), 'plugin 注入不应进 ## user')
   assert(!userSection.includes('技能目录清单'), 'skill-catalog 不应进 ## user')
 
-  // 只有被排除的来源 → 写占位行
+  // 只有被排除的来源 → 写占位行（assistant 文本让这一轮有内容：三样全空按新契约不落盘）
   engine.onSessionEvent({ id: sid }, turnStartEvent(7, 2))
   engine.onSessionEvent({ id: sid }, pluginMsgEvent(8, '只有注入上下文', 2))
-  engine.onSessionEvent({ id: sid }, turnEndEvent(9, 2))
+  engine.onSessionEvent({ id: sid }, assistantMsgEvent(9, '助手回复', 2))
+  engine.onSessionEvent({ id: sid }, turnEndEvent(10, 2))
   const body2 = fs.readFileSync(path.join(sessionDir(root, TMP, sid), 'turns', '0002.md'), 'utf8')
   const userSection2 = body2.split('## assistant')[0] ?? ''
   assert(userSection2.includes('（无用户文本）'), '没有可收录文本时应写（无用户文本）占位')
@@ -924,7 +924,7 @@ test('R7: ## user 只收 user + agent-message；plugin/skill-catalog 不收；�
 // ---- R8：新格式断言（三列轮次表 / 无 summary·links·files / 时间全 UTC） ----
 test('R8: 新格式：轮次表三列、无 summary/links/files、时间全 UTC', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'format-check'
   engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
   engine.onSessionEvent({ id: sid }, titleEvent(1, '格式检查'))
@@ -967,48 +967,30 @@ test('R8: 新格式：轮次表三列、无 summary/links/files、时间全 UTC'
 
 // ---- apply(ctx, config) 接线（直接驱动真实 apply，不 mock 被测对象） ----
 
-/** 假 cordis ctx：记录 apply 注册的监听器，并允许按事件名回放真实形状的载荷。 */
+/** 假 cordis ctx：记录 apply 注册的监听器、登记 settings.configure 调用，并允许按事件名回放载荷。 */
 interface FakeCtx {
   on(event: string, listener: (...args: unknown[]) => void): void
   emit(event: string, ...args: unknown[]): void
   listenerCount(): number
-  /** 可选的假设置服务（任务2 接线用）。 */
-  settings?: FakeSettingsProvider
+  inject(names: readonly string[], callback: (child: FakeChildCtx) => void): void
+  readonly fiber: { readonly fake: true }
+  /** apply 里 `settings.configure` 的调用记录（acceptance：auto:false + owner=fiber）。 */
+  readonly configureCalls: { readonly auto?: boolean; readonly owner: unknown }[]
 }
 
-/**
- * 假设置服务：只实现引擎真正用到的 `register`/`get`，**不 mock 被测对象**
- * （引擎与 normalize 都是真代码，这里只是替宿主保管一份 user 段）。
- */
-interface FakeSettingsProvider {
-  register(ns: string, schema: unknown, options: { applies: 'live' | 'restart' }): { get(): unknown; watch(cb: (a: unknown, b: unknown) => void): () => void }
-  get(ns: string): unknown
-  /** 直接改 user 段（模拟用户在设置页/文件里改设置）。 */
-  set(ns: string, patch: Record<string, unknown>): void
-}
-
-function fakeSettings(initial: Record<string, unknown> = {}): FakeSettingsProvider {
-  const sections = new Map<string, Record<string, unknown>>()
-  sections.set('conversation-recorder', { ...initial })
-  return {
-    register(_ns, _schema, _options) {
-      return {
-        get: () => sections.get('conversation-recorder') ?? {},
-        watch: () => () => {},
-      }
-    },
-    get(ns) {
-      return sections.get(ns)
-    },
-    set(ns, patch) {
-      sections.set(ns, { ...(sections.get(ns) ?? {}), ...patch })
-    },
+/** `ctx.inject(['settings'], child => …)` 里的子上下文替身。 */
+interface FakeChildCtx {
+  effect(callback: () => () => void): unknown
+  settings: {
+    configure(presentation: { readonly auto?: boolean }, owner?: unknown): () => void
   }
 }
 
 function fakeCtx(): FakeCtx {
   const listeners = new Map<string, ((...args: unknown[]) => void)[]>()
-  return {
+  const ctx: FakeCtx = {
+    fiber: { fake: true },
+    configureCalls: [],
     on(event, listener) {
       const list = listeners.get(event) ?? []
       list.push(listener)
@@ -1022,8 +1004,50 @@ function fakeCtx(): FakeCtx {
       for (const list of listeners.values()) total += list.length
       return total
     },
+    inject(names, callback) {
+      if (!names.includes('settings')) return
+      callback({
+        effect(callback) {
+          return callback()
+        },
+        settings: {
+          configure(presentation, owner) {
+            ctx.configureCalls.push({ auto: presentation.auto, owner })
+            return () => {}
+          },
+        },
+      })
+    },
+  }
+  return ctx
+}
+
+/**
+ * 可实时修改的 Config 替身：字段形状与 `.volatile()` 一致（只有 `get()`），
+ * `set()` 模拟设置页写入（引擎每个事件重读，不缓存）。
+ */
+function liveConfig(initial: Record<string, unknown> = {}): RecorderConfigLikeLive {
+  const resolved = Config(initial)
+  const state: Record<string, unknown> = {
+    enabled: resolved.enabled.get(),
+    root: resolved.root.get(),
+    recordSubagents: resolved.recordSubagents.get(),
+    toolArgsPreview: resolved.toolArgsPreview.get(),
+    emptyIndex: resolved.emptyIndex.get(),
+  }
+  return {
+    enabled: { get: () => state.enabled === true },
+    root: { get: () => (typeof state.root === 'string' ? state.root : '') },
+    recordSubagents: { get: () => state.recordSubagents === true },
+    toolArgsPreview: { get: () => Number(state.toolArgsPreview) },
+    emptyIndex: { get: () => state.emptyIndex === true },
+    set(field: string, value: unknown) {
+      state[field] = value
+    },
   }
 }
+
+type RecorderConfigLikeLive = RecorderConfig & { set(field: string, value: unknown): void }
 
 test('接线1: apply(ctx, config) 的 root 真接进引擎（配了 root 就写那里，与会话 cwd 无关）', () => {
   const base = freshDir()
@@ -1032,7 +1056,7 @@ test('接线1: apply(ctx, config) 的 root 真接进引擎（配了 root 就写�
   const sid = 'wire-root'
   const ctx = fakeCtx()
 
-  apply(ctx as unknown as Parameters<typeof apply>[0], { root: configured })
+  apply(ctx as unknown as Parameters<typeof apply>[0], Config({ root: configured }))
   assert.strictEqual(ctx.listenerCount(), 3, 'apply 应注册 session/created、session/event、session/disposed 三个监听器')
 
   ctx.emit('session/created', { id: sid, header: { cwd, createdAt: 1700000000000 } })
@@ -1073,7 +1097,7 @@ test('接线2: 不配 root → 落内置默认根 <$DSH_HOME>/_conversations（�
   const defaultRootDir = defaultRoot()
   assert.strictEqual(
     defaultRootDir,
-    path.join(process.env.DSH_HOME ?? path.join(homedir(), '.dsh'), CONVERSATIONS_DIR),
+    path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), CONVERSATIONS_DIR),
     `默认根应等于 <$DSH_HOME>/${CONVERSATIONS_DIR}（与宿主 resolveDshHome 口径一致）`,
   )
   // 引擎确实在往内置默认根下建目录（本进程可能被沙箱拦在工作区外 → 以 stderr 为证）
@@ -1084,30 +1108,28 @@ test('接线2: 不配 root → 落内置默认根 <$DSH_HOME>/_conversations（�
   assert(!fs.existsSync(path.join(cwd, CONVERSATIONS_DIR)), '不再往会话 cwd 下写 _conversations')
   assert(!fs.existsSync(path.join(cwd, CONVERSATIONS_DIR, workspaceDir(cwd), sidA)), '会话 cwd 下不应出现任何记录目录')
 
-  // ② 设置里的 root 最高优先（压过配置层）→ 落点跟着设置走，且改设置后立刻生效
+  // ② Config 的 root 真接进引擎；改 Config 里的 root 后同一会话下一轮立刻落到新根
   const settingsRootA = path.join(base, 'settings-root-a')
   const settingsRootB = path.join(base, 'settings-root-b')
-  const provider = fakeSettings({ root: settingsRootA })
+  const configB = liveConfig({ root: settingsRootA })
   const sidB = 'wire-settings'
   const ctxB = fakeCtx()
-  ctxB.settings = provider
-  apply(ctxB as unknown as Parameters<typeof apply>[0], { root: path.join(base, 'config-root-被设置压过') })
+  apply(ctxB as unknown as Parameters<typeof apply>[0], configB)
   ctxB.emit('session/created', { id: sidB, header: { cwd, createdAt: 1700000000000 } })
   ctxB.emit('session/event', { id: sidB }, turnStartEvent(1, 1))
-  ctxB.emit('session/event', { id: sidB }, userMsgEvent(2, '设置里的 root', 1))
+  ctxB.emit('session/event', { id: sidB }, userMsgEvent(2, 'Config 里的 root', 1))
   ctxB.emit('session/event', { id: sidB }, turnEndEvent(3, 1))
   assert(
     fs.existsSync(path.join(sessionDir(settingsRootA, cwd, sidB), 'turns', '0001.md')),
-    '设置里的 root 应最高优先（压过配置层）',
+    'Config 里的 root 应真接进引擎',
   )
-  assert(!fs.existsSync(path.join(base, 'config-root-被设置压过')), '配置层不应被用到（设置已给出 root）')
 
-  // 设置改成新 root → 同一个会话的下一轮立刻落到新 root（live，不用重启）
+  // Config 的 root 改成新值 → 同一个会话的下一轮立刻落到新 root（live，不用重启）
   // **0.3.0 契约变更（旧→新见 PROGRESS.md）**：序号只从**当前 root 下的那个会话目录**扫（SPEC §6/§8）。
   //   · 旧规则（个数口径，且「新根为空时不当作轮次被删」）→ 内存计数保持 1 ⇒ 新根下写 0002.md。
   //   · 新规则（磁盘最大序号 + 1）→ 新根下没有轮次 ⇒ max=0 ⇒ 新根下写 **0001.md**（旧根下的 0001 不动）。
   // 这正是 SPEC §8 已写明的已知行为：「换 root 之后旧根下的记录认不回来，在新根从头算」。
-  provider.set('conversation-recorder', { root: settingsRootB })
+  configB.set('root', settingsRootB)
   ctxB.emit('session/event', { id: sidB }, turnStartEvent(4, 2))
   ctxB.emit('session/event', { id: sidB }, userMsgEvent(5, '改设置后的第 2 轮', 2))
   ctxB.emit('session/event', { id: sidB }, turnEndEvent(6, 2))
@@ -1153,7 +1175,7 @@ test('W0: workspaceDir 纯函数：两条实测名逐字、cwd 缺失落未分�
 
 test('W1: 两个不同 cwd 的会话各落自己的工作区文件夹（文件夹名逐字照契约）', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const kbCwd = 'D:\\知识库'
   const ddCwd = 'D:\\大胆'
   const kb = 'kb-session'
@@ -1187,7 +1209,7 @@ test('W1: 两个不同 cwd 的会话各落自己的工作区文件夹（文件�
 
 test('W2: cwd 缺失 → 该会话落 未分组 文件夹', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'no-cwd'
   engine.onSessionCreated({ id: sid, header: { createdAt: 1700000000000 } })
   engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
@@ -1200,7 +1222,7 @@ test('W2: cwd 缺失 → 该会话落 未分组 文件夹', () => {
 
 test('W3: 工作区名含 # 被转义（保留字符不落进目录名）', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'hash-cwd'
   engine.onSessionCreated({ id: sid, header: { cwd: 'D:\\wk#dev', createdAt: 1700000000000 } })
   engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
@@ -1214,7 +1236,7 @@ test('W3: 工作区名含 # 被转义（保留字符不落进目录名）', () =
 
 test('W4: fork 子会话首轮 prev 指向同一工作区文件夹内的父轮次', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const cwd = 'D:\\知识库'
   const ws = 'D-知识库~77E5~8BC6~5E93'
   const parent = 'fork-parent-alt'
@@ -1247,18 +1269,18 @@ test('W4: fork 子会话首轮 prev 指向同一工作区文件夹内的父轮�
 // ============ 本轮新增（2026-09-15）：宿主侧四个设置 ============
 
 /** 用假设置服务造一个真实 SettingsSource（normalize/三层优先都是真代码）。 */
-function settingsEngine(initial: Record<string, unknown>, config: Parameters<typeof createSettingsSource>[0] = {}): RecorderEngine {
-  return new RecorderEngine(config, createSettingsSource(config, fakeSettings(initial)))
+function settingsEngine(initial: Record<string, unknown> = {}): RecorderEngine {
+  return new RecorderEngine(liveConfig(initial))
 }
 
 test('S0: 设置默认值：root=内置统一根（$DSH_HOME/_conversations）、recordSubagents=false、toolArgsPreview=40、emptyIndex=false', () => {
-  assert.strictEqual(defaultRoot(), path.join(process.env.DSH_HOME ?? path.join(homedir(), '.dsh'), CONVERSATIONS_DIR), '默认 root = <$DSH_HOME>/_conversations')
+  assert.strictEqual(defaultRoot(), path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), CONVERSATIONS_DIR), '默认 root = <$DSH_HOME>/_conversations')
 
-  // 空 user 段 + 空配置 → 四处都取内置默认
+  // 空配置 → 四处都取内置默认
   const root = freshDir()
   const engine = settingsEngine({ root })
   const sid = 'defaults'
-  const meta = JSON.stringify(createSettingsSource({}, fakeSettings({})).current())
+  const meta = JSON.stringify(settingsOf(Config({})))
   assert(meta.includes('"recordSubagents":false'), `recordSubagents 默认应为 false：${meta}`)
   assert(meta.includes('"toolArgsPreview":40'), `toolArgsPreview 默认应为 40：${meta}`)
   assert(meta.includes('"emptyIndex":false'), `emptyIndex 默认应为 false：${meta}`)
@@ -1336,8 +1358,9 @@ test('S2: toolArgsPreview 设置生效（0 / 10 / 200 与越界钳制）', () =>
   const body0 = fs.readFileSync(path.join(sessionDir(root, TMP, 's2-zero'), 'turns', '0001.md'), 'utf8')
   assert(body0.includes('- [call_b000000] glob  → 结果1行'), `toolArgsPreview=0 时参数预览为空，实际：\n${body0}`)
 
-  // 越界（500）→ 按 schema 上界 200 钳住
-  const engineBig = settingsEngine({ root, toolArgsPreview: 500 })
+  // 越界（500）：Config 的 schema 直接拒绝（不再静默钳制）；手写绕过 schema 时由 settingsOf 兜底钳到 200
+  assert.throws(() => settingsEngine({ root, toolArgsPreview: 500 }), /<= 200/, '>200 必须由 Config schema 拒绝')
+  const engineBig = settingsEngine({ root, toolArgsPreview: 200 })
   const previewBig = longArgs.slice(0, 200)
   engineBig.onSessionCreated({ id: 's2-big', header: { cwd: TMP, createdAt: 1700000000000 } })
   engineBig.onSessionEvent({ id: 's2-big' }, turnStartEvent(1, 1))
@@ -1345,7 +1368,7 @@ test('S2: toolArgsPreview 设置生效（0 / 10 / 200 与越界钳制）', () =>
   engineBig.onSessionEvent({ id: 's2-big' }, toolResultEvent(3, 'call_c00000000000000', 'ok'))
   engineBig.onSessionEvent({ id: 's2-big' }, turnEndEvent(4, 1))
   const bodyBig = fs.readFileSync(path.join(sessionDir(root, TMP, 's2-big'), 'turns', '0001.md'), 'utf8')
-  assert(bodyBig.includes(previewBig), 'toolArgsPreview>200 应钳到 200 字')
+  assert(bodyBig.includes(previewBig), 'toolArgsPreview=200 应保留前 200 字')
   assert(!bodyBig.includes(previewBig + longArgs.slice(200, 201)), '不应超过 200 字')
 })
 
@@ -1379,47 +1402,51 @@ test('S4: emptyIndex=true → 只发 title 就建目录并写 index（默认 fal
   assert.deepStrictEqual(fs.readdirSync(root2), [], 'emptyIndex=false 时只发 title 不产生任何文件（空壳目录 bug）')
 })
 
-// ============ 本轮新增（2026-09-15 0.2.1）：真 schemastery schema ============
+// ============ 0.2.1 配置模型：Config schema ============
 
-test('S5: 设置 schema 是真 schemastery（宿主注册时当函数调用）：四字段默认值与 0–200 取值域可还原', () => {
-  assert.strictEqual(typeof RecorderSettingsSchema, 'function', 'schema 必须是可调用的 schemastery schema（普通对象会让宿主 TypeError）')
-  const resolved = RecorderSettingsSchema({}) as Record<string, unknown>
-  assert.strictEqual(resolved.root, defaultRoot(), 'root 默认值 = 内置统一根（$DSH_HOME/_conversations）')
-  assert.strictEqual(resolved.recordSubagents, false, 'recordSubagents 默认 false')
-  assert.strictEqual(resolved.toolArgsPreview, DEFAULT_TOOL_ARGS_PREVIEW, 'toolArgsPreview 默认 40')
-  assert.strictEqual(resolved.emptyIndex, false, 'emptyIndex 默认 false')
-  assert.throws(() => { RecorderSettingsSchema({ toolArgsPreview: MAX_TOOL_ARGS_PREVIEW + 1 }) }, /<= 200/, '>200 必须由 schema 拒绝')
-  assert.throws(() => { RecorderSettingsSchema({ toolArgsPreview: -1 }) }, />= 0/, '<0 必须由 schema 拒绝')
+test('S5: Config 是真 schemastery schema、五字段全 .volatile()、默认值与 0–200 取值域可还原', () => {
+  assert.strictEqual(typeof Config, 'function', 'Config 必须是可调用的 schemastery schema')
+  const resolved = Config({}) as unknown as Record<string, { get(): unknown }>
+  for (const field of ['enabled', 'root', 'recordSubagents', 'toolArgsPreview', 'emptyIndex']) {
+    assert.strictEqual(typeof resolved[field]?.get, 'function', `${field} 必须是 .volatile() 暴露的 get() 引用`)
+  }
+  // 五字段的 schema JSON 里都必须带 volatile 标记（宿主据此把它们变成稳定引用）
+  const json = Config.toJSON() as { refs: Record<string, { meta?: { volatile?: boolean } }> }
+  const volatileFields = Object.values(json.refs).filter((node) => node.meta?.volatile === true).length
+  assert.strictEqual(volatileFields, 5, `五个字段必须全部 .volatile()，实际 ${String(volatileFields)}`)
+  assert.strictEqual(resolved.root?.get(), defaultRoot(), 'root 默认值 = 内置统一根（$DSH_HOME/_conversations）')
+  assert.strictEqual(resolved.recordSubagents?.get(), false, 'recordSubagents 默认 false')
+  assert.strictEqual(resolved.toolArgsPreview?.get(), DEFAULT_TOOL_ARGS_PREVIEW, 'toolArgsPreview 默认 40')
+  assert.strictEqual(resolved.emptyIndex?.get(), false, 'emptyIndex 默认 false')
+  assert.strictEqual(resolved.enabled?.get(), true, 'enabled 默认 true')
+  assert.throws(() => { Config({ toolArgsPreview: MAX_TOOL_ARGS_PREVIEW + 1 }) }, /<= 200/, '>200 必须由 schema 拒绝')
+  assert.throws(() => { Config({ toolArgsPreview: -1 }) }, />= 0/, '<0 必须由 schema 拒绝')
   // 设置页的渲染形状：toJSON() → new Schema(json) 必须还原同样的默认值
-  const restored = new z(RecorderSettingsSchema.toJSON())
-  assert.deepStrictEqual(restored({}), resolved, 'toJSON → new Schema(json) 应还原同样的默认值')
+  const restored = new z(Config.toJSON())({}) as unknown as Record<string, { get(): unknown }>
+  assert.strictEqual(restored.root?.get(), defaultRoot(), 'toJSON → new Schema(json) 应还原 root 默认值')
+  assert.strictEqual(restored.toolArgsPreview?.get(), DEFAULT_TOOL_ARGS_PREVIEW, '还原后的 toolArgsPreview 默认 40')
 })
 
-test('S6: 注册失败不再静默——stderr 写一行警告，再退回装配配置（上一轮翻车根因）', () => {
-  const base = freshDir()
-  const configured = path.join(base, 'config-fallback')
-  const provider = {
-    register(): never {
-      throw new TypeError('schema is not a function')
-    },
+test('S6: 宿主接线用 settings.configure({auto:false}, ctx.fiber)，且不再调用 settings.register', () => {
+  const ctx = fakeCtx()
+  apply(ctx as unknown as Parameters<typeof apply>[0])
+  assert.strictEqual(ctx.configureCalls.length, 1, 'apply 应且只应 configure 一次')
+  assert.strictEqual(ctx.configureCalls[0]?.auto, false, 'auto 必须为 false（本插件自带设置分区）')
+  assert.strictEqual(ctx.configureCalls[0]?.owner, ctx.fiber, 'owner 必须是插件自己的 fiber')
+  const settingsSource = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/settings.ts'), 'utf8')
+  const engineSource = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/engine.ts'), 'utf8')
+  for (const [name, text] of [['settings.ts', settingsSource], ['engine.ts', engineSource]] as const) {
+    assert(!text.includes('provider.register(') && !text.includes('settings.register('), `${name} 不得再调用 settings.register`)
+    assert(!text.includes('createSettingsSource'), `${name} 不得再保留 createSettingsSource`)
+    assert(!text.includes('SettingsProviderLike'), `${name} 不得再声明旧 SettingsProvider 接口`)
   }
-  let source: ReturnType<typeof createSettingsSource> | undefined
-  const captured = captureStderr(() => {
-    source = createSettingsSource({ root: configured }, provider as Parameters<typeof createSettingsSource>[1])
-  })
-  assert(captured.includes('settings register failed'), `注册失败必须写 stderr 警告，实际 ${JSON.stringify(captured)}`)
-  assert(captured.includes('conversation-recorder'), 'stderr 警告必须点名命名空间')
-  assert(captured.includes('schema is not a function'), 'stderr 警告必须带上原始错误文本')
-  assert(source !== undefined, 'createSettingsSource 必须仍然返回可用来源')
-  assert.strictEqual(source.current().root, configured, '注册失败后应退回装配配置 root')
-  assert.strictEqual(source.current().recordSubagents, false, '注册失败后其余字段取内置默认')
 })
 
 // ============ 本轮新增（2026-09-15）：三处修复 ============
 
 test('X1: 缺号修复——漏掉一轮（写盘失败）后继续，序号仍连续无缺口', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'gap-fix'
   const dir = sessionDir(root, TMP, sid)
   engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
@@ -1449,7 +1476,7 @@ test('X1: 缺号修复——漏掉一轮（写盘失败）后继续，序号仍�
 
 test('X2: 空壳目录修复——只发标题事件不产生任何文件', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'shell'
   const dir = sessionDir(root, TMP, sid)
   engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
@@ -1474,7 +1501,7 @@ test('X3: 正斜杠修复——cwd 含 `/` 时工作区名只做分隔符替换�
   assert(!workspaceDir('C:/a/b').includes('/'), '工作区名不得含 `/`')
 
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'slash'
   engine.onSessionCreated({ id: sid, header: { cwd: 'D:/知识库', createdAt: 1700000000000 } })
   engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
@@ -1492,13 +1519,13 @@ test('C-client: lib/client.js 是自注册 bundle：settings.section 槽齐（id
   assert(result.exportKeys.includes('apply'), '客户端导出必须含 apply')
   assert(result.exportKeys.includes('inject'), '客户端导出必须含 inject')
   assert(result.inject.includes('slots'), 'inject 必须含 slots')
-  assert(result.inject.includes('remote.settings'), 'inject 必须含 remote.settings')
+  assert(result.inject.includes('configForms'), 'inject 必须含 configForms（0.2.1 设置模型）')
   assert.strictEqual(result.section.name, 'settings.section', '槽 name')
   assert.strictEqual(result.section.id, 'conversationRecorder', '槽 id（契约要求）')
   assert.strictEqual(result.section.label, '会话记录', '槽 label')
-  assert.strictEqual(result.section.locale, 'conversation-recorder', '槽 locale（命名空间）')
-  assert(result.injectFaceKeys.includes('ctx'), '槽 inject 必须把客户端 ctx 交给组件')
-  assert.strictEqual(result.describeCallsAtMount, 0, '挂载阶段不应主动读设置（读值在组件挂载后）')
+  assert.strictEqual(result.section.locale, 'dsh-conversation-recorder', '槽 locale（= profile 条目 id）')
+  assert(result.injectFaceKeys.includes('form'), '槽 inject 必须把 ConfigForm 交给组件')
+  assert.strictEqual(result.formEntryId, 'dsh-conversation-recorder', 'configForms 必须按 profile 条目 id 取表单')
   // 外部依赖保持外部：产物里只 require 宿主基线模块，不内联 react
   assert(result.source.includes('require("react")'), 'react 必须保持外部 require')
   assert(result.source.includes('__ModuleLoader__.load'), '产物必须是浏览器自注册 bundle')
@@ -1552,178 +1579,123 @@ test('C-client-2: 设置分区没有裸原生控件（input/button/label），�
   )
 })
 
-// ============ 本轮新增（0.2.1）：真宿主 SettingsProvider 集成用例（防静默事故复发） ============
-//
-// 上一轮翻车的原因：本插件交了个普通对象当 schema，宿主 `register()` 把它当函数调用 →
-// `TypeError: schema is not a function`，又被裸 catch 吞掉。这里**直接 import 安装树里的真
-// SettingsProvider**，用真 `register` 与真 `resolve`，只把 `this` 换成假的（section 读原始
-// user 段、registrations 空表、ctx.effect 立刻执行回调），把这条链钉死。
+// ============ 0.2.1 宿主兼容（Config getter / v4 工具结果 / 监听容错 / 空轮次） ============
 
-/**
- * 真宿主设置实现入口：优先直接解析 `@deepseek-ai/dsh-settings`（声明在 devDependencies 时走这条），
- * 退回「从已安装的同伴 peer `dsh-home-paths` 反推同目录」——本地开发环境里那是个指向 DSH 安装树的
- * junction，两条路径都能落到真 `SettingsProvider`。
- *
- * 返回空串 = 这台机器上找不到真宿主实现（例如 CI 只装了本仓库的 devDependencies）。
- */
-function realDshSettingsEntry(): string {
-  try {
-    return fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-settings'))
-  } catch {
-    // 没直接声明时退回反推
+test('I1: settingsOf 读出 Config 五字段真值；手写越界值按 schema 边界钳制', () => {
+  const root = path.join(TMP, 'i1-root')
+  const config = Config({ root, toolArgsPreview: MAX_TOOL_ARGS_PREVIEW, enabled: false, recordSubagents: true, emptyIndex: true })
+  const values = settingsOf(config)
+  assert.strictEqual(values.root, root, 'root 应原样读出')
+  assert.strictEqual(values.enabled, false, 'enabled=false 应读出')
+  assert.strictEqual(values.recordSubagents, true, 'recordSubagents=true 应读出')
+  assert.strictEqual(values.emptyIndex, true, 'emptyIndex=true 应读出')
+  assert.strictEqual(values.toolArgsPreview, MAX_TOOL_ARGS_PREVIEW, '边界值 200 应原样读出')
+
+  const handWritten = {
+    enabled: { get: () => true },
+    root: { get: () => root },
+    recordSubagents: { get: () => false },
+    toolArgsPreview: { get: () => 500 },
+    emptyIndex: { get: () => false },
   }
-  try {
-    const peer = import.meta.resolve('@deepseek-ai/dsh-home-paths')
-    // .../node_modules/@deepseek-ai/dsh-home-paths/lib/index.js → .../node_modules/@deepseek-ai
-    const scopeDir = path.dirname(path.dirname(path.dirname(fileURLToPath(peer))))
-    const candidate = path.join(scopeDir, 'dsh-settings', 'lib', 'index.js')
-    if (fs.existsSync(candidate)) return candidate
-  } catch {
-    // 解析不到就返回空串，交给下面统一处理
-  }
-  return ''
-}
-
-const realSettingsEntry = realDshSettingsEntry()
-/**
- * 「真宿主 SettingsProvider」集成用例（I1–I3）的**环境前提**：机器上能加载到真 `SettingsProvider`。
- *
- * 本仓库是**插件**，宿主实现（`@deepseek-ai/dsh-settings`）不在它的依赖里；CI 只装本仓库的
- * devDependencies，因此这三条在 CI 里报「环境缺失（跳过）」而不是假装通过——**不是放宽判据**：
- * 只要加载到了真实现，下面的断言一条不少。为什么要报出来而不是静默略过：上一轮的翻车
- * （`schema is not a function` 被裸 catch 吞掉）正是「没跑也看不出来」造成的。
- */
-const realSettingsSkip = realSettingsEntry === ''
-  ? '环境缺失：这台机器解析不到 @deepseek-ai/dsh-settings（真宿主设置实现）'
-  : ''
-
-/**
- * 真 provider 的假 `this`（只在加载到真实现时被赋值；`register`/`resolve`/`describe` 全是宿主真代码）。
- * 用「调用时才取」的形式，避免 `let` 在赋值前的暂时性死区。
- */
-let realSettingsImpl: { prototype: object } | undefined
-
-function realProvider(userSection: Record<string, unknown> | undefined): {
-  register(ns: string, schema: unknown, options: { applies: 'live' | 'restart'; base?: object }): { get(): unknown }
-  describe(options?: { redactSecrets?: boolean }): readonly Record<string, unknown>[]
-} {
-  const impl = realSettingsImpl
-  assert(impl !== undefined, '真 SettingsProvider 未加载（realProvider 只应在可加载时被调用）')
-  const provider = Object.create(impl.prototype) as Record<string, unknown>
-  provider.registrations = new Map()
-  provider.document = userSection === undefined ? {} : { 'conversation-recorder': userSection }
-  // cordis 的 ctx.effect 会「立刻执行回调并登记清理」；本替身保留立刻执行这一关键语义
-  provider.ctx = { effect: (callback: () => unknown) => { callback() } }
-  // 真 section 的口径：读命名空间的**原始 user 段**（没写就是 undefined）
-  provider.section = () => userSection
-  return provider as unknown as ReturnType<typeof realProvider>
-}
-
-if (realSettingsEntry !== '') {
-  const realSettingsModule = await import(pathToFileURL(realSettingsEntry).href) as {
-    SettingsProvider: { prototype: object }
-  }
-  const RealSettingsProvider = realSettingsModule.SettingsProvider
-  assert.strictEqual(typeof RealSettingsProvider, 'function', `真 SettingsProvider 必须加载成功：${realSettingsEntry}`)
-  realSettingsImpl = RealSettingsProvider
-  realProviderCases()
-} else {
-  console.log(`\n  - I1–I3 ${realSettingsSkip}：跳过 3 条（严格判据一字未改，加载到真实现时照跑）`)
-}
-
-/** I1–I3 的用例体（只在真实现可用时注册；否则一条都不注册，计数里也不出现）。 */
-function realProviderCases(): void {
-
-test('I1: 真 SettingsProvider.register(真 schemastery schema) 不抛；describe({redactSecrets}) 找得到该命名空间', () => {
-  const provider = realProvider(undefined)
-  const scope = provider.register('conversation-recorder', RecorderSettingsSchema, { applies: 'live', base: entrySettings({}) })
-  assert(scope.get() !== undefined, 'scope.get() 必须返回解析后的值')
-  const described = provider.describe({ redactSecrets: true })
-  const descriptor = described.find((item) => item.ns === 'conversation-recorder')
-  assert(descriptor !== undefined, `describe 必须列出 conversation-recorder，实际 ${JSON.stringify(described.map((item) => item.ns))}`)
-  assert.strictEqual(descriptor.applies, 'live', 'applies 必须是 live（改完即时生效）')
-  assert.deepStrictEqual(descriptor.value, scope.get(), 'describe.value 必须等于 scope.get()')
-  assert.deepStrictEqual(descriptor.value, entrySettings({}), '解析后的默认值必须与 SPEC §8 一致')
-  assert.deepStrictEqual(descriptor.secrets, [], '本插件没有 secret 字段')
+  assert.strictEqual(settingsOf(handWritten).toolArgsPreview, MAX_TOOL_ARGS_PREVIEW, '手写越界值应钳到 200')
+  const negative = { ...handWritten, toolArgsPreview: { get: () => -3 } }
+  assert.strictEqual(settingsOf(negative).toolArgsPreview, 0, '手写负值应钳到 0')
 })
 
-test('I2: describe 的 schema 能被 schemastery 的 new Schema(json) 还原（设置页渲染用的形状）', () => {
-  const provider = realProvider(undefined)
-  provider.register('conversation-recorder', RecorderSettingsSchema, { applies: 'live', base: entrySettings({}) })
-  const descriptor = provider.describe({ redactSecrets: true }).find((item) => item.ns === 'conversation-recorder')
-  assert(descriptor !== undefined && descriptor.schema !== undefined, 'descriptor 必须带 schema')
-  const restored = new z(descriptor.schema)
-  assert.strictEqual(typeof restored, 'function', 'schema 必须能被 new Schema(json) 还原成可调用 schema')
-  assert.deepStrictEqual(restored({}), RecorderSettingsSchema({}), '还原后的 schema 默认值必须与原 schema 一致')
-  assert.throws(() => { restored({ toolArgsPreview: MAX_TOOL_ARGS_PREVIEW + 1 }) }, /<= 200/, '还原后的 schema 必须保留 0–200 取值域')
+test('I2: 引擎每个事件重读 Config getter——同一实例改 toolArgsPreview / enabled 立刻生效', () => {
+  const root = freshDir()
+  const config = liveConfig({ root, toolArgsPreview: 10 })
+  const engine = new RecorderEngine(config)
+  const sid = 'i2-live'
+  const longArgs = JSON.stringify({ pattern: 'Z'.repeat(80) })
+  engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
+  engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
+  engine.onSessionEvent({ id: sid }, userMsgEvent(2, '第一轮', 1))
+  engine.onSessionEvent({ id: sid }, toolCallEvent(3, 'call_i2_0000000000', 'glob', longArgs))
+  engine.onSessionEvent({ id: sid }, toolResultEvent(4, 'call_i2_0000000000', 'ok'))
+  engine.onSessionEvent({ id: sid }, turnEndEvent(5, 1))
+  const body1 = fs.readFileSync(path.join(sessionDir(root, TMP, sid), 'turns', '0001.md'), 'utf8')
+  assert(body1.includes(`glob ${longArgs.slice(0, 10)} `), '第一轮应按 Config 里的 10 字截断')
+
+  config.set('toolArgsPreview', 0)
+  engine.onSessionEvent({ id: sid }, turnStartEvent(6, 2))
+  engine.onSessionEvent({ id: sid }, userMsgEvent(7, '第二轮', 2))
+  engine.onSessionEvent({ id: sid }, toolCallEvent(8, 'call_i2_0000000001', 'glob', longArgs))
+  engine.onSessionEvent({ id: sid }, toolResultEvent(9, 'call_i2_0000000001', 'ok'))
+  engine.onSessionEvent({ id: sid }, turnEndEvent(10, 2))
+  const body2 = fs.readFileSync(path.join(sessionDir(root, TMP, sid), 'turns', '0002.md'), 'utf8')
+  assert(body2.includes('glob  → 结果1行'), '改成 0 后参数预览应为空（同一个引擎实例，不重启）')
+
+  config.set('enabled', false)
+  engine.onSessionEvent({ id: sid }, turnStartEvent(11, 3))
+  engine.onSessionEvent({ id: sid }, userMsgEvent(12, '关闭后', 3))
+  engine.onSessionEvent({ id: sid }, turnEndEvent(13, 3))
+  assert(!fs.existsSync(path.join(sessionDir(root, TMP, sid), 'turns', '0003.md')), 'enabled=false 后不应再落盘')
 })
 
-test('I3: 真 provider 下根解析：用户段给了 root 就跟着变、没给就是内置默认根，并压过配置层', () => {
-  const base = freshDir()
-  const userRoot = path.join(base, 'user-root')
-  const configRoot = path.join(base, 'config-root')
-
-  const noUser = createSettingsSource({}, realProvider(undefined))
-  assert.strictEqual(noUser.current().root, defaultRoot(), '用户段没给 root → 内置默认根')
-
-  const withUser = createSettingsSource({}, realProvider({ root: userRoot }))
-  assert.strictEqual(withUser.current().root, userRoot, '用户段给了 root → 解析跟着变')
-
-  const both = createSettingsSource({ root: configRoot }, realProvider({ root: userRoot }))
-  assert.strictEqual(both.current().root, userRoot, '设置层 root 压过装配配置层')
-
-  const onlyConfig = createSettingsSource({ root: configRoot }, realProvider(undefined))
-  assert.strictEqual(onlyConfig.current().root, configRoot, '设置层没给 root 时用装配配置层')
-})
-}
-
-// ============ 本轮新增（0.2.2）：Remote 信封解包（设置页读不到真值的根因） ============
-//
-// 0.2.1 的客户端半边把宿主 Remote 的返回值**直接当数据用**，而宿主返回的是信封
-// `{ok:true,value}` / `{ok:false,error}`（官方客户端就这么解）。下面直接用真模块
-// `src/client/remote-envelope.ts`（不 import react、不 import 宿主包）钉死这条链。
-
-test('E1: remote 信封解包——{ok:true,value:{namespaces:[…]}} 能取到命名空间', () => {
-  const response = {
-    ok: true,
-    value: { namespaces: [{ ns: 'conversation-recorder', value: { toolArgsPreview: 60 }, revision: 3 }] },
-  }
-  const described = unwrapRemoteEnvelope<{ namespaces: readonly { ns: string }[] }>(response, '读取设置')
-  assert.deepStrictEqual(
-    described.namespaces.map((item) => item.ns),
-    ['conversation-recorder'],
-    '解包后应拿到 namespaces（而不是 undefined）',
-  )
+test('I3: v4 tool/result（顶层 toolCallId + text 块）三行文本 → 工具行「结果3行」', () => {
+  const root = freshDir()
+  const engine = new RecorderEngine(Config({ root }))
+  const sid = 'v4-result'
+  engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
+  engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
+  engine.onSessionEvent({ id: sid }, userMsgEvent(2, '看结果', 1))
+  engine.onSessionEvent({ id: sid }, toolCallEvent(3, 'call_v4_00000000000', 'fs_read', '{"path":"a.md"}'))
+  engine.onSessionEvent({ id: sid }, toolResultEvent(4, 'call_v4_00000000000', '第一行\n第二行\n第三行'))
+  engine.onSessionEvent({ id: sid }, turnEndEvent(5, 1))
+  const body = fs.readFileSync(path.join(sessionDir(root, TMP, sid), 'turns', '0001.md'), 'utf8')
+  assert(body.includes('→ 结果3行'), `v4 三行结果必须写「结果3行」，实际：\n${body}`)
+  assert(!body.includes('结果0行'), 'v4 载荷不得再被当成 0 行')
 })
 
-test('E2: remote 信封解包——{ok:false,error:{message}} 抛出该 message', () => {
-  assert.throws(
-    () => unwrapRemoteEnvelope({ ok: false, error: { message: 'settings namespace not registered' } }, '读取设置'),
-    (error: unknown) => error instanceof Error && error.message === 'settings namespace not registered',
-    '失败信封必须原样抛出 error.message',
-  )
+test('E1: 空轮次（user / assistant / 工具三样全空）不建目录、不落盘、不占号', () => {
+  const root = freshDir()
+  fs.mkdirSync(root, { recursive: true })
+  const engine = new RecorderEngine(Config({ root }))
+  const sid = 'empty-turn'
+  engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
+  engine.onSessionEvent({ id: sid }, turnStartEvent(1, 1))
+  engine.onSessionEvent({ id: sid }, turnEndEvent(2, 1))
+  assert(!fs.existsSync(sessionDir(root, TMP, sid)), '三样全空的轮次不应建目录')
+  assert.deepStrictEqual(fs.readdirSync(root), [], 'root 下不应有任何文件')
+
+  // 下一轮有内容 → 仍从 0001 起（空轮次不占号）
+  engine.onSessionEvent({ id: sid }, turnStartEvent(3, 2))
+  engine.onSessionEvent({ id: sid }, userMsgEvent(4, '有内容', 2))
+  engine.onSessionEvent({ id: sid }, turnEndEvent(5, 2))
+  assert.deepStrictEqual(turnFiles(sessionDir(root, TMP, sid)), ['0001.md'], '空轮次之后仍应从 0001 起')
 })
 
-test('E3: remote 信封解包——裸载荷（无 ok 字段）必须报错，不许静默当 value', () => {
-  // 0.2.1 的现场就是这里：`{namespaces:[…]}` 被当成 value，`namespaces` 实为 undefined
-  assert.throws(() => unwrapRemoteEnvelope({ namespaces: [] }, '读取设置'), /不是信封|缺 ok/)
-  assert.throws(() => unwrapRemoteEnvelope(undefined, '读取设置'), /不是信封|缺 ok/)
-  assert.throws(() => unwrapRemoteEnvelope([{ ns: 'conversation-recorder' }], '读取设置'), /不是信封|缺 ok/)
+test('E2: 监听器兜底——session/created 里抛错只记 stderr，不抛回事件总线', () => {
+  const ctx = fakeCtx()
+  apply(ctx as unknown as Parameters<typeof apply>[0])
+  const hostile = { get id(): string { throw new Error('boom-id') } }
+  const captured = captureStderr(() => {
+    ctx.emit('session/created', hostile)
+  })
+  assert(captured.includes('session/created listener failed'), `监听器异常必须留痕，实际：${JSON.stringify(captured)}`)
+  assert(captured.includes('boom-id'), 'stderr 应带原始错误文本')
 })
 
-test('E4: 写路径也必须解包——mutate 失败不许显示「已保存」', () => {
-  assert.doesNotThrow(
-    () => unwrapRemoteEnvelope({ ok: true, value: { revision: 4 } }, '保存设置'),
-    '成功信封应通过',
-  )
-  assert.throws(
-    () => unwrapRemoteEnvelope({ ok: false, error: { message: 'revision conflict' } }, '保存设置'),
-    /revision conflict/,
-    '写失败必须抛错（否则状态行会显示假成功）',
-  )
+test('E3: 客户端 inject 声明 slots+configForms；源码不再出现 remote.settings / remote-envelope', () => {
+  const repo = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
+  const source = fs.readFileSync(path.join(repo, 'src', 'client', 'index.ts'), 'utf8')
+  assert(source.includes("export const inject = ['slots', 'configForms']"), 'inject 必须恰好声明 slots + configForms')
+  assert(source.includes('configForms.get(NS)'), 'apply 必须用 ctx.configForms.get(NS) 取表单')
+  assert(source.includes('getSnapshot') && source.includes('subscribe') && source.includes('form.set('), '读写必须走 ConfigForm 的 getSnapshot/subscribe/set')
+  assert(!source.includes('remote.settings') && !source.includes('remote-envelope') && !source.includes('unwrapRemoteEnvelope'), '旧的 remote.settings / remote-envelope 通道必须已删除')
 })
 
-test('C-client-3: 设置分区不给 Input 传 style（外观交回官方控件）；读写都走 remote-envelope 解包', () => {
+test('E4: lib/client.js 通过 configForms.get(NS) 取表单，产物不含 remote.settings', () => {
+  const result = probeClientBundle()
+  assert.strictEqual(result.formEntryId, 'dsh-conversation-recorder', 'configForms 条目 id 必须是新命名空间')
+  assert(result.inject.includes('configForms'), 'bundle 的 inject 必须含 configForms')
+  assert(!result.source.includes('remote.settings'), '产物不得再出现 remote.settings')
+  assert(!result.source.includes('remote-envelope'), '产物不得再引用 remote-envelope')
+})
+
+test('C-client-3: 设置分区不给 Input 传 style；写路径逐字段走 form.set（无信封、无本地 revision）', () => {
   const repo = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
   const source = fs.readFileSync(path.join(repo, 'src', 'client', 'index.ts'), 'utf8')
 
@@ -1749,15 +1721,10 @@ test('C-client-3: 设置分区不给 Input 传 style（外观交回官方控件�
   for (const block of propsBlocks) {
     assert(!block.includes('style'), `Input 不许再传 style（会打进内层内容层）：${block}`)
   }
-  // 解包模块必须真被用上：读一次、写一次
-  assert(source.includes("from './remote-envelope'"), '客户端必须 import remote-envelope 解包模块')
-  assert(
-    source.split('unwrapRemoteEnvelope').length - 1 >= 3, // import 1 处 + 读 1 处 + 写 1 处
-    '读/写两条路径都必须解包（unwrapRemoteEnvelope 至少出现 3 次：import + 读 + 写）',
-  )
-  // 构建接线：相对模块必须被打进 lib/client.js 的本地模块表，否则浏览器解析不到
-  const bundle = fs.readFileSync(path.join(repo, 'lib', 'client.js'), 'utf8')
-  assert(bundle.includes('"./remote-envelope":'), 'lib/client.js 必须把 remote-envelope 装进本地模块表')
+  // 写路径：每个改动字段一次 form.set，宿主服务负责 revision/回读
+  assert(source.includes('await form.set(field, formState[field])'), '保存必须逐字段调用 form.set')
+  assert(!source.includes('unwrapRemoteEnvelope'), '写路径不得再有信封解包')
+  assert(!source.includes('remote.settings'), '写路径不得再走 remote.settings')
 })
 
 // ============ 本轮新增（0.2.3）：懒建档续号（修「插件重开/进程重启后静默丢轮次」） ============
@@ -1778,7 +1745,7 @@ function turnFiles(sessionDirPath: string): string[] {
 
 test('L1: 懒建档——空表 + 未调 onSessionCreated，直接发首轮事件也应落 0001.md', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'lazy-first'
   const dir = sessionDir(root, TMP, sid)
 
@@ -1803,7 +1770,7 @@ test('L2: 重载/重启（全新实例、从未收到 onSessionCreated）直接�
   const header = { cwd: TMP, createdAt: 1700000000000 }
 
   // 重载前：正常建档、写满 2 轮
-  const before = new RecorderEngine({ root })
+  const before = new RecorderEngine(Config({ root }))
   before.onSessionCreated({ id: sid, header })
   for (let t = 1; t <= 2; t += 1) {
     before.onSessionEvent({ id: sid }, turnStartEvent(t * 3 - 2, t))
@@ -1814,7 +1781,7 @@ test('L2: 重载/重启（全新实例、从未收到 onSessionCreated）直接�
 
   // 模拟插件停用重开 / 进程重启：**全新引擎**（内存记录为空），此后**不调 onSessionCreated**，
   // 直接发第 3 轮的事件（真宿主 `session/event` 的载荷是完整 Session，header 就在上面）
-  const after = new RecorderEngine({ root })
+  const after = new RecorderEngine(Config({ root }))
   after.onSessionEvent({ id: sid, header }, turnStartEvent(7, 3))
   after.onSessionEvent({ id: sid, header }, userMsgEvent(8, '重载后的第 3 轮', 3))
   after.onSessionEvent({ id: sid, header }, turnEndEvent(9, 3))
@@ -1900,23 +1867,25 @@ test('N2: 同一引擎先关后开 → 开后那轮正常落盘、序号连续�
   assert.strictEqual(fs.existsSync(rootA), false, '未被用到的 root 不该被创建')
 })
 
-test('N3: enabled 默认值与 false 都能被 schema / 三层解析还原', () => {
-  // ① 引擎默认（无设置服务、无配置）：enabled 默认 true
-  // （用 createSettingsSource / entrySettings 这两个既有出口读默认值，避免改动文件顶部的 import 行）
-  assert.strictEqual(createSettingsSource({}, undefined).current().enabled, true, '无设置服务时 enabled 默认 true')
-  assert.strictEqual(entrySettings({}).enabled, true, '未配置任何字段时 enabled 默认 true')
+test('N3: enabled 默认值与显式 false 都能被 Config / 引擎还原', () => {
+  // ① Config 默认 enabled=true
+  assert.strictEqual(Config({}).enabled.get(), true, 'Config 默认 enabled=true')
+  assert.strictEqual(settingsOf(Config({})).enabled, true, 'settingsOf 默认 enabled=true')
 
-  // ② schema 默认值 + toJSON → new Schema(json) 还原
-  const resolved = RecorderSettingsSchema({}) as Record<string, unknown>
-  assert.strictEqual(resolved.enabled, true, 'schema 默认 enabled=true')
-  const restored = new z(RecorderSettingsSchema.toJSON())
-  assert.strictEqual((restored({}) as Record<string, unknown>).enabled, true, 'toJSON → new Schema(json) 应还原 enabled 默认值')
+  // ② toJSON → new Schema(json) 还原默认值
+  const restored = new z(Config.toJSON())({}) as unknown as { enabled: { get(): boolean } }
+  assert.strictEqual(restored.enabled.get(), true, 'toJSON → new Schema(json) 应还原 enabled 默认值')
 
-  // ③ 显式 false 在三条路径上都能还原：装配配置 / 用户段 / schema
-  assert.strictEqual(entrySettings({ enabled: false }).enabled, false, '装配配置 enabled=false 应被采纳')
-  const source = createSettingsSource({}, fakeSettings({ enabled: false }))
-  assert.strictEqual(source.current().enabled, false, '用户段 enabled=false 应被采纳')
-  assert.strictEqual((RecorderSettingsSchema({ enabled: false }) as Record<string, unknown>).enabled, false, 'schema 接受 enabled=false')
+  // ③ 显式 false：Config 接受，引擎也照它执行
+  assert.strictEqual(Config({ enabled: false }).enabled.get(), false, 'Config 接受 enabled=false')
+  const root = freshDir()
+  fs.mkdirSync(root, { recursive: true })
+  const engine = new RecorderEngine(Config({ root, enabled: false }))
+  engine.onSessionCreated({ id: 'n3-off', header: { cwd: TMP, createdAt: 1700000000000 } })
+  engine.onSessionEvent({ id: 'n3-off' }, turnStartEvent(1, 1))
+  engine.onSessionEvent({ id: 'n3-off' }, userMsgEvent(2, '关闭', 1))
+  engine.onSessionEvent({ id: 'n3-off' }, turnEndEvent(3, 1))
+  assert.deepStrictEqual(fs.readdirSync(root), [], 'enabled=false 时引擎不应落盘')
 })
 
 // ============ 本轮新增（0.3.0）：序号规则改成「磁盘上已存在的最大序号 + 1」 ============
@@ -1990,7 +1959,7 @@ test('P5: nextSeq 撞号仍拒覆写——目标号已存在时一律给出更�
 
 test('P6: 端到端——磁盘上有洞（0001,0002,0004）时会话下一轮写 0005，而不是被拒或被顶替', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'hole-e2e'
   const dir = sessionDir(root, TMP, sid)
   const turnsDir = path.join(dir, 'turns')
@@ -2026,7 +1995,7 @@ test('P6: 端到端——磁盘上有洞（0001,0002,0004）时会话下一轮�
 
 test('G1: 首个内容轮次落盘后，根下出现 README.md 与 AGENTS.md（首行生成标记）', () => {
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'docs-first'
   assert(!fs.existsSync(path.join(root, 'README.md')), '先决条件：落盘前根下没有 README.md')
   assert(!fs.existsSync(path.join(root, 'AGENTS.md')), '先决条件：落盘前根下没有 AGENTS.md')
@@ -2062,7 +2031,7 @@ test('G2: 文档幂等——已存在一律不动（含无标记的手写文件�
   const readmeBefore = fs.readFileSync(path.join(root, 'README.md'), 'utf8')
   const agentsBefore = fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8')
 
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const err = captureStderr(() => {
     engine.onSessionCreated({ id: sid, header: { cwd: TMP, createdAt: 1700000000000 } })
     for (let t = 1; t <= 2; t += 1) {
@@ -2078,7 +2047,7 @@ test('G2: 文档幂等——已存在一律不动（含无标记的手写文件�
 
   // 只缺一个时只补那一个；再跑一轮不再重复写
   fs.rmSync(path.join(root, 'AGENTS.md'))
-  const engine2 = new RecorderEngine({ root })
+  const engine2 = new RecorderEngine(Config({ root }))
   engine2.onSessionCreated({ id: 'docs-idem-2', header: { cwd: TMP, createdAt: 1700000000000 } })
   engine2.onSessionEvent({ id: 'docs-idem-2' }, turnStartEvent(1, 1))
   engine2.onSessionEvent({ id: 'docs-idem-2' }, userMsgEvent(2, '补 AGENTS 的一轮', 1))
@@ -2131,7 +2100,7 @@ test('Q1: onSessionDisposed 连 headers 一起回收（长跑进程不再按会�
   // ① 纯函数级：ensureRootDocs 不会写 root 之外的任何位置（防御性；root 由调用方给出）
   // ② 引擎级：disposed 的会话，即使**只带 { id }**（载荷没 header）的事件也不得被"补档"复活
   const root = freshDir()
-  const engine = new RecorderEngine({ root })
+  const engine = new RecorderEngine(Config({ root }))
   const sid = 'header-gc'
   const header = { cwd: TMP, createdAt: 1700000000000 }
   const dir = sessionDir(root, TMP, sid)
@@ -2196,65 +2165,33 @@ test('Q3: 源码守卫——onSessionDisposed 必须同时清 headers；目录�
   assert.deepStrictEqual(offenders, [], `目录名字面量只允许在 paths.ts 的 CONVERSATIONS_DIR 出现一次，实际：${offenders.join(' | ')}`)
 })
 
-testAsync('Q2: 保存在 mutate 成功后回读**真** revision / 真值（不许本地自增猜版本号）', async () => {
-  // 假 Remote：revision 走一条**非线性**规则（mutate 后从 41 跳到 97），本地 +1 必错
-  let revision = 41
-  const user: Record<string, unknown> = { root: 'D:/old', toolArgsPreview: 40 }
-  const calls: { describe: number; mutate: { ops: number; expected: number | undefined }[] } = { describe: 0, mutate: [] }
-  const remote = {
-    async describe() {
-      calls.describe += 1
-      return { ok: true as const, value: { namespaces: [{ ns: 'conversation-recorder', value: { ...user }, user: { ...user }, revision }] } }
-    },
-    async mutate(_ns: string, ops: readonly { op: 'set'; path: readonly string[]; value: unknown }[], expected?: number) {
-      calls.mutate.push({ ops: ops.length, expected })
-      for (const op of ops) user[op.path[0] ?? ''] = op.value
-      revision = 97 // 宿主端的真实新版本号（不是 42）
-      return { ok: true as const, value: { revision } }
-    },
-  }
-
-  const loaded = await loadSettings(remote, 'conversation-recorder')
-  assert.strictEqual(loaded.revision, 41, '读到的应是宿主真 revision 41')
-  const result = await saveSettings(remote, 'conversation-recorder', [{ op: 'set', path: ['toolArgsPreview'], value: 60 }])
-
-  assert.strictEqual(result.ops, 1, '应写 1 项')
-  assert.strictEqual(result.revision, 97, '保存后必须回读到真 revision 97（本地自增会得到 42）')
-  assert.strictEqual(result.value.toolArgsPreview, 60, '回读的真值应含刚落盘的字段')
-  assert.strictEqual(calls.mutate.length, 1, '只调一次 mutate')
-  assert.strictEqual(calls.mutate[0]?.expected, 41, 'mutate 必须带上**读到的**真 revision 做并发保护')
-  assert.strictEqual(calls.describe, 3, '读一次 + 保存前读一次 + 保存后回读一次 = 3 次 describe')
-
-  // 没有改动 ⇒ 不调 mutate
-  const noop = await saveSettings(remote, 'conversation-recorder', [])
-  assert.strictEqual(noop.ops, 0, '没有改动时 ops=0')
-  assert.strictEqual(calls.mutate.length, 1, '没有改动时不许调 mutate')
-
-  // mutate 失败 ⇒ 必须抛（显示「保存失败」，不许假成功）
-  const failing = {
-    ...remote,
-    async mutate() {
-      return { ok: false as const, error: { message: 'revision conflict' } }
-    },
-  }
-  await assert.rejects(
-    () => saveSettings(failing, 'conversation-recorder', [{ op: 'set', path: ['root'], value: 'D:/x' }]),
-    /revision conflict/,
-    'mutate 失败必须把宿主错误原样抛出',
-  )
+test('Q2: 设置页保存只走 form.set（不本地自增 revision、不解信封），拒绝时显示失败', () => {
+  const repo = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
+  const source = fs.readFileSync(path.join(repo, 'src', 'client', 'index.ts'), 'utf8')
+  // 写：逐字段 form.set；revision/回读/并发保护全由宿主 ConfigForm 负责
+  assert(source.includes('await form.set(field, formState[field])'), '保存必须逐字段调用 form.set')
+  assert(!/revision\s*\+\s*1/.test(source), '不得在客户端本地自增 revision')
+  assert(!source.includes('expectedRevision'), '不得自己拼 expectedRevision（宿主服务负责 fencing）')
+  assert(!source.includes('unwrapRemoteEnvelope') && !source.includes('remote.settings'), '不得再走旧信封通道')
+  // 宿主拒绝（form.set 返回 false）→ 状态行必须显示失败，不许假成功
+  assert(source.includes('保存被宿主拒绝'), 'form.set 返回 false 时必须显示失败提示')
+  // 快照没到 / 不可写时保存按钮不可点
+  assert(source.includes('disabled: !ready || !writable'), '加载中或不可写时必须禁用保存')
 })
 
-test('Q4: 发布一致性接线——版本 1.0.0、verify/verify:privacy 脚本、CI 跑全部门禁、runtime deps 为空', () => {
+test('Q4: 发布一致性接线——版本 2.0.0、engines.dsh、verify/verify:privacy 脚本、CI 跑全部门禁、runtime deps 为空', () => {
   const repo = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
   const pkg = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')) as {
     version: string
+    engines: Record<string, string>
     scripts: Record<string, string>
     dependencies?: Record<string, string>
     devDependencies: Record<string, string>
     peerDependencies: Record<string, string>
   }
-  assert.strictEqual(pkg.version, '1.0.0', '版本应为 1.0.0')
+  assert.strictEqual(pkg.version, '2.0.0', '版本应为 2.0.0（设置 key 变更属破坏性）')
   assert.strictEqual(pkg.dependencies, undefined, 'dependencies 必须为空（运行时不依赖任何包）')
+  assert.strictEqual(pkg.engines.dsh, '^0.2.1-rc.2', 'engines.dsh 必须写 ^0.2.1-rc.2（0.2.1 的配置模型）')
   assert.strictEqual(
     pkg.scripts.verify,
     'pnpm build && git diff --exit-code -- lib',
@@ -2266,6 +2203,25 @@ test('Q4: 发布一致性接线——版本 1.0.0、verify/verify:privacy 脚本
     assert(peer in pkg.peerDependencies, `${peer} 必须声明为 peerDependency`)
     assert(peer in pkg.devDependencies, `${peer} 必须在 devDependencies 里（CI/开发解析用）`)
   }
+  assert.strictEqual(pkg.peerDependencies['@deepseek-ai/dsh-home-paths'], '^0.2.1-rc.2', 'dsh-home-paths peer 必须写 ^0.2.1-rc.2')
+  assert.strictEqual(pkg.peerDependencies['@deepseek-ai/schemastery'], '^3.18.5', 'schemastery peer 必须写 ^3.18.5')
+  // 0.2.1 的宿主包全部升到同一版本；新增 dsh-scope / dsh-typert-protocol
+  for (const pkgName of [
+    '@deepseek-ai/dsh-attachment',
+    '@deepseek-ai/dsh-home-paths',
+    '@deepseek-ai/dsh-llm',
+    '@deepseek-ai/dsh-scope',
+    '@deepseek-ai/dsh-session',
+    '@deepseek-ai/dsh-settings',
+    '@deepseek-ai/dsh-typert-protocol',
+  ]) {
+    assert.strictEqual(pkg.devDependencies[pkgName], '0.2.1-rc.2', `${pkgName} 必须升到 0.2.1-rc.2`)
+  }
+  assert.strictEqual(pkg.devDependencies['@deepseek-ai/schemastery'], '3.18.5', 'schemastery dev 必须写 3.18.5')
+  // 包清单里不得再残留 0.1.5-rc.1（兼容门禁会整包跳过）
+  assert(!JSON.stringify(pkg).includes('0.1.5-rc.1'), 'package.json 不得残留 0.1.5-rc.1')
+  const lock = fs.readFileSync(path.join(repo, 'pnpm-lock.yaml'), 'utf8')
+  assert(!lock.includes('0.1.5-rc.1'), 'pnpm-lock.yaml 不得残留 0.1.5-rc.1')
 
   // CI：node 22 与 24，且八条门禁一条不落
   const ci = fs.readFileSync(path.join(repo, '.github', 'workflows', 'ci.yml'), 'utf8')
@@ -2275,16 +2231,15 @@ test('Q4: 发布一致性接线——版本 1.0.0、verify/verify:privacy 脚本
   }
   assert(ci.includes('probe-real-settings.ts') && ci.includes('probe-client-bundle.ts'), 'CI 必须跑两个只读探针')
 
-  // .gitignore：构建中间目录与测试沙箱都不入库
+  // .gitignore：构建中间目录仍不入库（测试临时目录已改到系统临时目录，不再依赖 tests/.tmp）
   const rootIgnore = fs.readFileSync(path.join(repo, '.gitignore'), 'utf8')
   assert(rootIgnore.includes('.client-build-tmp/'), '.gitignore 必须忽略 .client-build-tmp/')
-  assert(fs.readFileSync(path.join(repo, 'tests', '.gitignore'), 'utf8').includes('.tmp/'), 'tests/.gitignore 必须忽略 .tmp/')
 })
 
 // ---- 汇总 ----
 await Promise.all(pendingTests)
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)
-// 跑完清掉测试沙箱 tests/.tmp（已 gitignore；失败时也清，避免残留影响下一次运行）
+// 跑完清掉测试沙箱（系统临时目录；失败时也清，避免残留影响下一次运行）
 fs.rmSync(TMP, { recursive: true, force: true })
 if (failed > 0) {
   process.exit(1)

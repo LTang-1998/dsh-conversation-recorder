@@ -1,26 +1,12 @@
 /**
- * dsh-conversation-recorder —— 路径与时间。
+ * 路径与时间。
  *
- * root 解析（设置 → 配置 → 内置 `$DSH_HOME/_conversations`）、会话目录名安全化、轮次文件名、
- * 全契约统一的 UTC 时间。零运行时依赖：仅 node 内置。
+ * root 解析（Config 的 root → 内置 `$DSH_HOME/_conversations`）、会话目录名安全化、
+ * 轮次文件名、全契约统一的 UTC 时间。零运行时依赖：仅 node 内置。
  */
 
 import * as os from 'node:os'
 import * as path from 'node:path'
-
-/** 插件配置：五个字段都可以缺（缺哪层就往下一层退，见 SPEC §8）。 */
-export interface RecorderConfig {
-  /** 总开关（默认 true）；false 时引擎不产出任何新文件，已有记录不动。 */
-  readonly enabled?: boolean
-  /** 记录根目录（即 `_conversations` 目录本身）；空/未配置 → 设置层 → 内置默认根。 */
-  readonly root?: string
-  /** 是否也记录子代理会话；默认 false。 */
-  readonly recordSubagents?: boolean
-  /** 工具清单行参数预览字数（0–200）；默认 40。 */
-  readonly toolArgsPreview?: number
-  /** 元数据事件是否也建目录并写 index；默认 false。 */
-  readonly emptyIndex?: boolean
-}
 
 /** 默认记录目录名（跟在 `$DSH_HOME` 后面）。 */
 export const CONVERSATIONS_DIR = '_conversations'

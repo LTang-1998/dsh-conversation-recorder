@@ -1,7 +1,8 @@
 /**
  * 客户端 bundle 的加载链检查（可复用）：
  * 给 `lib/client.js` 搭一个最小浏览器内核替身 —— `window.__ModuleLoader__.load({id, factory})`
- * 的自注册 → 工厂物化 → `apply()` 注册 `settings.section` 槽 → 槽的 `inject` 面有客户端 ctx。
+ * 的自注册 → 工厂物化 → `apply()` 注册 `settings.section` 槽 → 槽的 `inject` 面带一份
+ * `configForms` 表单。
  *
  * 供 `tests/run.ts` 的用例与 `tests/probe-client-bundle.ts` 探针共用（真代码，不 mock 被测对象）。
  */
@@ -21,8 +22,8 @@ export interface ClientBundleProbe {
   readonly section: { readonly name: string; readonly id: string; readonly label: string; readonly locale: string }
   /** 槽 `inject()` 返回面的键。 */
   readonly injectFaceKeys: readonly string[]
-  /** 挂载阶段是否主动调了 settings remote 的 describe（应当不调，读值在组件挂载后）。 */
-  readonly describeCallsAtMount: number
+  /** `apply` 向 configForms 请求的条目 id（应为插件 profile 条目 id）。 */
+  readonly formEntryId: string
   readonly source: string
 }
 
@@ -65,7 +66,18 @@ export function probeClientBundle(bundlePath = path.join(repo, 'lib', 'client.js
   if (typeof exportsOf.apply !== 'function') throw new Error('exports.apply 必须是函数')
 
   const registered: unknown[] = []
-  let describeCalls = 0
+  let formEntryId = ''
+  // 0.2.1 的 ConfigForm 替身：只给 apply 阶段会用到的最小面（组件不渲染）
+  const form = {
+    getSnapshot: () => ({
+      status: 'ready',
+      value: { enabled: true, root: '', recordSubagents: false, toolArgsPreview: 40, emptyIndex: false },
+      revision: 0,
+      writable: true,
+    }),
+    subscribe: () => () => {},
+    set: async (): Promise<boolean> => true,
+  }
   const fakeCtx = {
     slots: {
       inject: (name: string, callback: () => unknown): void => {
@@ -77,13 +89,10 @@ export function probeClientBundle(bundlePath = path.join(repo, 'lib', 'client.js
         return () => {}
       },
     },
-    remote: {
-      settings: {
-        describe: async (): Promise<unknown> => {
-          describeCalls += 1
-          return { namespaces: [] }
-        },
-        mutate: async (): Promise<void> => undefined,
+    configForms: {
+      get: (entryId: string) => {
+        formEntryId = entryId
+        return form
       },
     },
   }
@@ -115,7 +124,7 @@ export function probeClientBundle(bundlePath = path.join(repo, 'lib', 'client.js
       locale: typeof definition.locale === 'string' ? definition.locale : '',
     },
     injectFaceKeys: Object.keys(definition.inject() as object),
-    describeCallsAtMount: describeCalls,
+    formEntryId,
     source,
   }
 }

@@ -19,10 +19,9 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { ensureRootDocs } from './docs.ts'
 import { readIndexMeta, readTurnRows, renderIndex, renderTurn, scanTurnSeqs } from './format.ts'
 import { isoFromEpochMs, isoNow, resolveRoot, safeSessionDir, seqFile, workspaceDir } from './paths.ts'
-import type { RecorderConfig } from './paths.ts'
 import { nextSeq } from './seq.ts'
-import { createSettingsSource, defaultRoot } from './settings.ts'
-import type { RecorderSettings, SettingsProviderLike, SettingsSource } from './settings.ts'
+import { Config, defaultRoot, settingsOf } from './settings.ts'
+import type { RecorderConfig, RecorderSettings } from './settings.ts'
 
 /** 一次工具调用的待配对信息（tool/call 记下，tool/result 取出成行）。 */
 interface PendingTool {
@@ -90,29 +89,18 @@ function contentOf(message: { content?: readonly ContentBlock[] } | undefined): 
   return message?.content ?? []
 }
 
-/**
- * tool/result 的结果文本：解包 `content[0]`（tool-result 块）内的 text 块。
- * 真实载荷实测：`message.content[0].content[0].text`（见 PROGRESS.md 任务0）。
- */
-function toolResultText(content: readonly ContentBlock[]): string {
-  const block = content[0]
-  if (block === undefined || block.type !== 'tool-result') return ''
-  return textOf(block.content)
-}
-
 /** 错误对象取一行可读文本。 */
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
 /**
- * 记录引擎。五个设置（enabled/root/recordSubagents/toolArgsPreview/emptyIndex）由
- * `SettingsSource` 在每次读取时解析：设置 → 配置 → 内置默认（见 SPEC §8）。
+ * 记录引擎。五个设置由 `Config` 的 `.volatile()` 字段提供（`config.<field>.get()`，
+ * 每个事件重读，不缓存；设置页写入后立刻生效，见 SPEC §8）。
  */
 export class RecorderEngine {
-  /** 装配配置里的 root（设置缺席时的第二层）。 */
-  private readonly configRoot: string
-  private readonly settings: SettingsSource
+  /** 宿主传进来的 Config 实例（五个字段都是稳定引用）。 */
+  private readonly config: RecorderConfig
   private readonly sessions = new Map<string, SessionRec>()
   /**
    * 本进程见过的会话 header（来自 `session/created`）。只用于「后续事件载荷没带 header」时补档：
@@ -122,19 +110,18 @@ export class RecorderEngine {
   /** 已 `session/disposed` 的会话 id：headerless 的后续事件不得靠补档把它们重新建档。 */
   private readonly disposed = new Set<string>()
 
-  constructor(config: RecorderConfig = {}, settings?: SettingsSource) {
-    this.configRoot = config.root ?? ''
-    this.settings = settings ?? createSettingsSource(config, undefined)
+  constructor(config: RecorderConfig = Config({})) {
+    this.config = config
   }
 
   /** 当前设置快照（每次读都重算，改完即时生效）。 */
   private current(): RecorderSettings {
-    return this.settings.current()
+    return settingsOf(this.config)
   }
 
-  /** 记录根：设置 root → 配置 root → 内置 `<$DSH_HOME>/_conversations`。 */
+  /** 记录根：Config 的 root → 内置 `<$DSH_HOME>/_conversations`。 */
   private recorderRoot(): string {
-    return resolveRoot(this.current().root, this.configRoot, defaultRoot())
+    return resolveRoot(this.current().root, '', defaultRoot())
   }
 
   /**
@@ -405,8 +392,9 @@ export class RecorderEngine {
   }
 
   /**
-   * tool/result：callId 取自 `message.source.callId`（与 tool/call 配对），
-   * 结果文本解包 `message.content[0].content`，错误码取 `error?.code`。
+   * tool/result：callId 取 `message.toolCallId ?? message.source.callId`（0.2.1 的 v4
+   * 载荷把 callId 放在消息顶层，旧载荷在 source 里），结果文本直接取消息 content 的
+   * text 块（v4 去掉了旧的 `type:'tool-result'` 包壳），错误码取 `error?.code`。
    * 没有配对 tool/call 的结果不出行（不捏造）；结构异常（无 callId）直接跳过。
    */
   private onToolResult(
@@ -414,12 +402,12 @@ export class RecorderEngine {
     message: ToolResultMessage,
     error: { readonly name: string; readonly code: string } | undefined,
   ): void {
-    const callId = (message as { source?: { callId?: unknown } } | undefined)?.source?.callId
+    const callId = message.toolCallId ?? message.source?.callId
     if (typeof callId !== 'string' || callId === '') return
     const pending = rec.pendingTools.get(callId)
     if (pending === undefined) return
     rec.pendingTools.delete(callId)
-    const text = toolResultText(contentOf(message))
+    const text = textOf(contentOf(message))
     const lineCount = text === '' ? 0 : text.split('\n').length
     let line = `- [${callId.slice(0, 12)}] ${pending.name} ${pending.argsPreview} → 结果${lineCount}行`
     if (error !== undefined && typeof error.code === 'string') {
@@ -452,6 +440,12 @@ export class RecorderEngine {
    */
   private onTurnEnd(rec: SessionRec, turn: number, reasonKind: string): void {
     const kind = reasonKind === '' ? 'completed' : reasonKind
+
+    // 空轮次（user / assistant / 工具清单三样全空）不落盘：不建目录、不写文件、不占号。
+    if (rec.userLines.length === 0 && rec.assistantLines.length === 0 && rec.toolLines.length === 0) {
+      this.discardBuffers(rec)
+      return
+    }
 
     // 懒建：首个内容轮次落盘时才建目录；建不出来就丢弃本轮
     this.refreshDir(rec)
@@ -596,30 +590,53 @@ export class RecorderEngine {
 
 /* ---- cordis 接线 ---- */
 
-/** 本插件用到的 ctx.on 重载与可选的 settings 服务（不引入 cordis 运行时/类型依赖）。 */
+/** 本插件用到的 ctx 面（不引入 cordis 运行时/类型依赖，结构兼容即可）。 */
 export interface PluginCtx {
   on(event: 'session/created', listener: (session: Session) => void): unknown
   on(event: 'session/disposed', listener: (session: Session) => void): unknown
   on(event: 'session/event', listener: (session: Session, event: SessionEvent) => void): unknown
-  /** 设置服务；插件声明 `inject: ['settings']`，未挂载时缺席。 */
-  settings?: SettingsProviderLike
+  /** 运行时注入 settings 服务（0.2.1 的配置模型：插件自己 export Config）。 */
+  inject(names: readonly string[], callback: (child: PluginChildCtx) => void): unknown
+  /** 插件 fiber：`settings.configure` 的 owner（与宿主官方插件同一写法）。 */
+  readonly fiber: unknown
 }
 
-/** 插件静态声明：告诉 cordis 本插件需要 settings 服务（缺席也能加载）。 */
-export const inject = ['settings'] as const
+/** `ctx.inject(['settings'], child => …)` 里的子上下文。 */
+export interface PluginChildCtx {
+  effect(callback: () => () => void): unknown
+  settings: {
+    configure(presentation: { readonly auto?: boolean }, owner?: unknown): () => void
+  }
+}
 
-/** 接线薄壳：把 ctx 事件接到引擎上；`config` 作为设置的第二层接进引擎。 */
-export function apply(ctx: PluginCtx, config: RecorderConfig = {}): void {
-  const settings = createSettingsSource(config, ctx.settings)
-  const engine = new RecorderEngine(config, settings)
-  // 设置改了立刻生效：引擎不缓存任何设置值，每个事件都重读 `settings.current()`
+/** 监听器兜底：任何异常只记 stderr，不抛回宿主事件总线（一个坏事件不能拖垮会话）。 */
+function guard(label: string, run: () => void): void {
+  try {
+    run()
+  } catch (error: unknown) {
+    process.stderr.write(`dsh-conversation-recorder: ${label} listener failed: ${errorText(error)}\n`)
+  }
+}
+
+/**
+ * 接线薄壳：把 ctx 事件接到引擎上；`config` 是宿主按 `Config` 解析出的实例
+ * （五个字段都是 `.volatile()` 稳定引用，引擎每次事件重读，设置改了立刻生效）。
+ *
+ * `settings.configure({ auto: false }, ctx.fiber)`：本插件自带设置分区（客户端
+ * `configForms`），告诉宿主不要再自动生成一张设置页。
+ */
+export function apply(ctx: PluginCtx, config: RecorderConfig = Config({})): void {
+  const engine = new RecorderEngine(config)
+  ctx.inject(['settings'], (child) => {
+    child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
+  })
   ctx.on('session/created', (session) => {
-    engine.onSessionCreated(session)
+    guard('session/created', () => { engine.onSessionCreated(session) })
   })
   ctx.on('session/event', (session, event) => {
-    engine.onSessionEvent(session, event)
+    guard('session/event', () => { engine.onSessionEvent(session, event) })
   })
   ctx.on('session/disposed', (session) => {
-    engine.onSessionDisposed(session)
+    guard('session/disposed', () => { engine.onSessionDisposed(session) })
   })
 }

@@ -9,10 +9,11 @@
  *   - `react` 与 `@deepseek-ai/*` 保持外部（`require("react")` 由 shell 的基线模块表回答），
  *     不在产物里内联任何宿主库。
  *
- * 相对模块（`src/client/*.ts`，例如 `remote-envelope.ts`）：`tsc --noResolve` 只按文件列表
- * 编译、不解析 import，直出的 CJS 里相对 `require("./x")` 会在浏览器里解析不到。故这里把
- * 同目录的每个客户端模块都编一遍，再装进 bundle 内部的**小模块表** `__modules`，
- * 由 `__localRequire` 先查表、查不到才交给 shell 的 `require`（即宿主基线模块）。
+ * 相对模块（`src/client/*.ts`）：`tsc --noResolve` 只按文件列表编译、不解析 import，
+ * 直出的 CJS 里相对 `require("./x")` 会在浏览器里解析不到。故这里把同目录的每个客户端
+ * 模块都编一遍，再装进 bundle 内部的**小模块表** `__modules`，由 `__localRequire` 先查表、
+ * 查不到才交给 shell 的 `require`（即宿主基线模块）。当前客户端只有一个模块（入口），
+ * 模块表允许为空（0 个本地模块）。
  *
  * 用法：node build-client.mjs（由 build.mjs 调用）
  */
@@ -118,10 +119,7 @@ for (const match of bundle.matchAll(/\brequire\(\s*"(\.[^"]*)"\s*\)/g)) {
     process.exit(1)
   }
 }
-if (modules.length < 2) {
-  console.error('build-client FAILED: 本地模块表为空（应至少含 remote-envelope）')
-  process.exit(1)
-}
+// 本地模块表允许为空：客户端可以只有入口一个模块（0 个相对模块）。
 
 fs.writeFileSync(path.join(outDir, 'client.js'), bundle, 'utf8')
 

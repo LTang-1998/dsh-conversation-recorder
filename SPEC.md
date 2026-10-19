@@ -10,7 +10,7 @@ DSH 会话目前只活在压缩日志（zstd）里，不可读不可引。本插
 
 ## 2. 布局
 
-布局表达式：`_conversations/<工作区文件夹>/<sessionId>/{index.md,turns/NNNN.md}`（第一段 `_conversations` 指 **root**——默认即 `$DSH_HOME/_conversations`，可被设置/配置改到别处，见下）。
+布局表达式：`_conversations/<工作区文件夹>/<sessionId>/{index.md,turns/NNNN.md}`（第一段 `_conversations` 指 **root**——默认即 `$DSH_HOME/_conversations`，可由 `Config.root` 改到别处，见下）。
 
 ```
 <root>/                        # 记录根（默认为内置统一位置 <$DSH_HOME>/_conversations，见 §8）
@@ -21,13 +21,13 @@ DSH 会话目前只活在压缩日志（zstd）里，不可读不可引。本插
             └── NNNN.md         # 轮次正文，NNNN 为 4 位零填充序号（0001.md, 0002.md …）
 ```
 
-**根解析顺序**（三种来源都再按工作区分一级，工作区名只由会话 cwd 决定）：
+**根解析顺序**（工作区名只由会话 cwd 决定，根只有一个来源）：
 
-1. 设置里的 `root`（命名空间 `conversation-recorder`，见 §8）——最高优先，用户改了就生效；
-2. 配置（`apply(ctx, config)` 的 `config.root`，或插件装配层的同一项）——次优先；
+1. 插件 `Config` 的 `root`（命名空间 `dsh-conversation-recorder`，见 §8）——宿主按 schema 解析后的当前值，用户改了就生效；
+2. 空串视为「没有值」；
 3. 内置默认 `$DSH_HOME/_conversations`（`$DSH_HOME` 由 `resolveDshHome()` 语义解析：显式值 → `$DSH_HOME` → `~/.dsh`）——兜底。
 
-空串/未配置视为「没有这一层」，逐级往下退，故三种情况都有确定落点、且**不再跟随各会话自己的 cwd**。
+0.2.1 起宿主只保留 `Config` 一层：旧的「设置服务 + 装配配置 + 内置默认」三层已合并成 `config.root.get()`，故落点**不再跟随各会话自己的 cwd**。
 
 工作区文件夹名（`workspaceDir(cwd)`，纯函数、同 cwd 恒定同名）逐条规则：
 
@@ -108,11 +108,12 @@ prev: ${叙事链上一轮路径；首轮且有 fork 基点时用它，否则留
 - agent 回答：`## assistant` 小节逐条正文文本（`assistant/message` 的 `message.content[].text` 合并；空 content 只载 usage 的消息跳过；无回答时写「（无正文）」）。
 - 工具调用 = 清单行，格式固定为：
   `- [${callId前12位}] ${工具名} ${参数预览} → 结果${X}行 [error:${code}]`
-  - `callId` 取自 `tool/result` 的 `message.source.callId`（与 `tool/call` 的 `callId` 配对）。
-  - X = 结果文本行数；结果文本解包自 `tool/result` 的 `message.content[0].content`（`type === 'text'` 的块）。文本为空记 0 行。
+  - `callId` 取自 `tool/result` 消息的 `message.toolCallId ?? message.source.callId`（0.2.1 的 v4 载荷把 callId 放在消息顶层，旧的 `source.callId` 仍在，作为兼容位；两者与 `tool/call` 的 `callId` 配对）。
+  - X = 结果文本行数；结果文本取 `tool/result` 消息 `message.content` 里的 `type === 'text'` 块（v4 已去掉旧的 `type:'tool-result'` 包壳）。文本为空记 0 行。
   - `${code}` 取自 `tool/result` 的 `error?.code`；无 error 时整段 `[error:…]` 省略。
   - `参数预览` = `arguments` 的 JSON 字符串前 `toolArgsPreview` 个字符（设置项，默认 40，取值域 0–200；默认行为即此前契约里的「前40字符」）。
   - 只有 `tool/call` 没有配对 `tool/result` 的调用不出行（避免捏造结果）。
+  - 一轮里 user / assistant / 工具清单**三样全空**时不落盘（不建目录、不写文件、不占序号）。
 - 若本轮还引入会话引用（`source.kind === 'session-reference'`），记一行：`- 引用会话 ${引用sessionId}`。
 
 ## 5. 契约字段表区块
@@ -132,7 +133,7 @@ prev: ${叙事链上一轮路径；首轮且有 fork 基点时用它，否则留
 | time | string | 轮次结束 ISO8601 UTC |
 | kind | string | turn/end reason.kind |
 | prev | string | 叙事链上一轮文件路径；跨会话 fork 首轮 ../<父id>/turns/NNNN.md |
-| callId | string(前12) | 工具清单行内联引用 [callId前12]，取自 tool/result 的 message.source.callId |
+| callId | string(前12) | 工具清单行内联引用 [callId前12]，取自 tool/result 消息的 `toolCallId ?? source.callId` |
 | 工具清单行 | — | `- [callId前12] 工具名 参数前 toolArgsPreview 字（默认 40，0–200）→ 结果X行 [error:code]` |
 
 <!-- CONTRACT-FIELDS-END -->
@@ -159,46 +160,45 @@ prev: ${叙事链上一轮路径；首轮且有 fork 基点时用它，否则留
 
 ## 7. 事件订阅（实现依赖）
 
-- `ctx.on('session/created', session => …)`：**登记时机是「首次见到该会话的事件」**——本处理器在收到该广播时建档（`session.header.origin !== 'subagent'` 才建；只记内存 record，首个内容轮次 turn/end 落盘时才建目录/index；同时按 §3.1 做 resume 自愈回填；`header.parentSession` 只登记 fork_from，基点等首个 `turn/start` 再定），`session/event` 在遇到仍未登记的会话时会自己补走同一段建档逻辑（见 §8），故这次广播没到达也能接上。
+- `ctx.on('session/created', session => …)`：**登记时机是「首次见到该会话的事件」**——本处理器在收到该广播时建档（`session.header.origin !== 'subagent'` 才建；只记内存 record，首个内容轮次 turn/end 落盘时才建目录/index；同时按 §3.1 做 resume 自愈回填；`header.parentSession` 只登记 fork_from，基点等首个 `turn/start` 再定），`session/event` 在遇到仍未登记的会话时会自己补走同一段建档逻辑（见 §8），故这次广播没到达也能接上。三个监听器都包 `try/catch`：异常只记 stderr，不抛回宿主事件总线。
 - `ctx.on('session/event', (session, event) => …)`：先判 `enabled`（§8，关闭则整轮不落盘）；再处理 `turn/start`、`user/message`、`assistant/message`、`tool/call`、`tool/result`、`turn/end`、`request/context`（填 model），以及插件扩展事件 `session/title`（填 title；该事件不在 `@deepseek-ai/dsh-session` 的核心事件联合里，按扩展类型识别）。载荷就是完整 `Session`（`header` 与 `session/created` 时同一个对象）。
 - `ctx.on('session/disposed', session => …)`：回收内存记录。
-- 载荷规格依据 `@deepseek-ai/dsh-session` 的 `SessionEventMap`（types.d.ts）与 `@deepseek-ai/dsh-llm` 的消息类型（`ToolResultMessage.source.callId` / `content[0].content`），并用真实会话日志（`session.v3.jsonl.zstd`）逐字核对。
+- 设置接线：`ctx.inject(['settings'], child => child.effect(() => child.settings.configure({ auto: false }, ctx.fiber)))`——本插件自带设置分区（§8），不让宿主自动生成设置页。
+- 载荷规格依据 `@deepseek-ai/dsh-session` 的 `SessionEventMap`（types.d.ts）与 `@deepseek-ai/dsh-llm` 的消息类型（`ToolResultMessage.toolCallId` / `source.callId` / `content` 的 text 块），并用 0.2.1 的真实 v4 会话日志逐字核对。
 
 ## 8. 配置
 
-宿主侧设置（命名空间 `conversation-recorder`，注册时 `applies: 'live'`），五个字段：
+0.2.1 的配置模型：插件在 `src/settings.ts` `export const Config = z.object({...})`，五个字段全部
+`.volatile()`（宿主把它们暴露成稳定引用 `config.<field>.get()`；每次读取都是当前值）。命名空间 =
+profile 里的插件条目 id `dsh-conversation-recorder`。
 
 | 字段 | 类型 | 默认值 | 说明 |
 | ---- | ---- | ------ | ---- |
 | `enabled` | boolean | `true` | **总开关**。`false` 时立即停止产出新文件：任何事件都不再落盘/补写 index，进行中的那一轮**整轮丢弃、不落半份**；**不删任何已有内容**（已落盘的 `index.md`/`turns/` 一字不动） |
-| `root` | string | 内置统一路径 `<$DSH_HOME>/_conversations`（`$DSH_HOME` 经 `resolveDshHome()`） | 记录根目录；空串视为未设置。三种来源的优先序见 §2。支持开头 `~` 展开 |
+| `root` | string | 内置统一路径 `<$DSH_HOME>/_conversations`（`$DSH_HOME` 经 `resolveDshHome()`） | 记录根目录；空串视为未设置（回退内置默认根）。支持开头 `~` 展开 |
 | `recordSubagents` | boolean | `false` | `true` 时子代理会话（`session.header.origin === 'subagent'`）也记录；默认不记 |
 | `toolArgsPreview` | number | `40` | 工具清单行里参数预览的字符数，取值 0–200（越界由 schema 拒绝） |
 | `emptyIndex` | boolean | `false` | `true` 时允许元数据事件（`session/title`/`request/context`）自行建目录并写 index；默认 false ⇒ 只有首个内容轮次落盘才建目录 |
 
-- **登记时机＝首次见到该会话的事件**（不是 `session/created` 那一次广播）：`session/event` 遇到未登记会话时先按其 `header`（缺失则用本进程 `session/created` 见过的 header 补档）走一遍 `onSessionCreated`（子代理过滤、不安全 id 兜底、resume 自愈都在里面），再处理本次事件。于是插件停用重开 / 进程重启后，正在跑的会话只要**再更新一次轮次**就被自动接上并续号；`session/created` 从未到达也照样建档。`session/disposed` 之后的会话在再次 `session/created` 之前不再建档（回收语义见 §2）。
-- **认已有记录靠磁盘**：`<root>/<工作区>/<会话id>/` + `index.md` + `turns/` 下的 `NNNN.md` 文件数（`restoreFromDisk`）。所以续号的前提是**落点算得一样**——工作区文件夹由会话 cwd 还原。某会话当初若记在**别的 root**（例如改过 `root` 设置），在**新根下认不出**它，那一会话会**从 `0001` 重开**（旧根下的记录不迁不删）。
-
-- **改完即时生效，不用重启**：`apply()` 通过 `ctx.settings` 注册本命名空间并 `watch()` 变更，每次事件读取当前解析值；被设置覆盖的五个点分别是总开关（`enabled`，最先判断）、落点解析（`root`）、子代理过滤（`recordSubagents`）、参数截断长度（`toolArgsPreview`）、建目录时机（`emptyIndex`）。
-- **schema 是真 schemastery**：`RecorderSettingsSchema = z.object({…})`（运行时 import `@deepseek-ai/schemastery`）。宿主 `register()` 在注册时会把 schema **当函数调用**求值（`resolve()`），设置页用 `schema.toJSON()` 渲染形状 —— 交普通对象会立刻抛 `TypeError: schema is not a function`。**注册失败不许静默**：必须往 stderr 写一行警告，再退回装配配置（0.2.1 修的正是这个故障）。
-- **设置页分区**：客户端半边注册 `settings.section` 槽（`id: conversationRecorder`、标签「会话记录」），控件全部来自宿主自带的 `@deepseek-ai/dsh-client-ui-primitives`（`Input`/`Button`）+ DSH 设计变量，行样式与官方「插件」分区同一套；读写走宿主 settings Remote（`describe` → `mutate`，只发改动过的字段），读/写失败显示在分区里。
-  - **Remote 返回的是信封**：`describe()` / `mutate()` 返回 `{ok:true,value}` 或 `{ok:false,error:{message}}`（与官方设置页同一口径）。读/写两条路径都必须先过 `src/client/remote-envelope.ts` 的 `unwrapRemoteEnvelope()`：`ok:true` 取 `value`、`ok:false` 抛出 `error.message`、**裸载荷（没有 `ok` 字段）直接报错**（不许静默当 `value`）。
-  - **不传 `style` 给官方 `Input`**：官方 `Input` 的 `style` 会落到内层 `input`（外框是外层 span），会造成「外框里套小框、两个输入框大小不一致」；外观交回官方控件，满宽由外层容器（竖向 flex）拉伸。
-- 未挂载设置服务时（`ctx.settings` 不存在）插件照常工作：退回 `apply(ctx, config)` 的装配配置，再退回上表默认值，行为不因缺服务而失效。
-- 解析顺序：设置里的值 → `apply(ctx, config)` 的 `config.root` → 内置默认。
+- **改完即时生效，不用重启**：引擎每个事件从 `config.<field>.get()` 重读，不缓存；被设置覆盖的五个点分别是总开关（`enabled`，最先判断）、落点解析（`root`）、子代理过滤（`recordSubagents`）、参数截断长度（`toolArgsPreview`）、建目录时机（`emptyIndex`）。
+- **schema 是真 schemastery**：`Config = z.object({…})`（运行时 import `@deepseek-ai/schemastery`）。宿主用它渲染/校验设置页；五个字段都 `.volatile()`，故 `config.enabled.get()` 等是稳定引用。`toolArgsPreview` 越界由 schema 直接拒绝（不再静默钳制）。
+- **不再有设置注册 API**：0.2.1 删掉了旧的设置注册模型；插件不再注册命名空间、也不再 `watch()`。`apply()` 只做 `ctx.inject(['settings'], child => child.effect(() => child.settings.configure({ auto: false }, ctx.fiber)))`，告诉宿主本插件自带设置分区。
+- **设置页分区**：客户端半边 `inject: ['slots', 'configForms']`，用 `ctx.configForms.get('dsh-conversation-recorder')` 取 `ConfigForm`：
+  - 读：`form.getSnapshot()`（`status/value/revision/writable`）+ `form.subscribe()`；
+  - 写：逐字段 `await form.set(field, value)`（revision、失败回读、写入排队都由宿主服务负责；客户端不再自己解信封、也不再自增版本号）。
+  - 控件全部来自宿主自带的 `@deepseek-ai/dsh-client-ui-primitives`（`Input`/`Button`）+ DSH 设计变量；**不传 `style` 给官方 `Input`**（会打进内层内容框）。读/写失败显示在分区里。
+- 未挂载设置服务时（`ctx.settings` 不存在）插件照常工作：直接使用宿主解析出的 `Config` 默认值。
+- root 只此一层：工作区文件夹仍按 `<root>/<workspaceDir(会话 cwd)>/<sessionId>/` 分一级（§2），工作区名只由会话 cwd 决定；`cwd` 缺失时落 `未分组`。
 
 ```ts
-interface RecorderConfig {
-  readonly enabled?: boolean         // 默认 true；false = 不产出新文件（已有记录不动）
-  readonly root?: string            // 记录根目录（即 `_conversations` 目录本身）；空/未配置 → 内置统一路径
-  readonly recordSubagents?: boolean // 默认 false
-  readonly toolArgsPreview?: number  // 默认 40（0–200）
-  readonly emptyIndex?: boolean      // 默认 false
-}
+export const Config = z.object({
+  enabled: z.boolean().default(true).volatile(),
+  root: z.string().default(defaultRoot()).volatile(),
+  recordSubagents: z.boolean().default(false).volatile(),
+  toolArgsPreview: z.natural().min(0).max(200).default(40).volatile(),
+  emptyIndex: z.boolean().default(false).volatile(),
+})
 ```
-
-- 三种 root 来源都再按工作区文件夹分一级：`<root>/<workspaceDir(会话 cwd)>/<sessionId>/`（§2）。工作区名只由**会话 cwd** 决定，与 root 来源无关；`cwd` 缺失时落 `未分组`。
-- `apply(ctx, config)` 必须把配置接进引擎（`root` 配置接线是契约的一部分）。
 
 ## 9. 不做什么（边界）
 
@@ -241,7 +241,7 @@ interface RecorderConfig {
 | ---- | ---- |
 | `pnpm typecheck` | `tsc -p tsconfig.json` → **0 error**（`skipLibCheck: false`，类型真过） |
 | `pnpm typecheck:client` | `tsc -p tsconfig.client.json` → **0 error** |
-| `node tests/run.ts` | 通过 ≥ 50、失败 0、跳过 0 |
+| `node tests/run.ts` | 通过 ≥ 64、失败 0、跳过 0（测试沙箱在系统临时目录，可用 `DSH_RECORDER_TEST_TMP` 覆盖） |
 | `node tests/spec-selfcheck.ts` | 绿（exit 0） |
 | `node tests/probe-real-settings.ts` / `node tests/probe-client-bundle.ts` | 各 exit 0 |
 | `pnpm verify` | `pnpm build` 后 `git diff --exit-code -- lib` **干净** ⇒ `lib/` 与 `src/` 一致 |
@@ -258,4 +258,4 @@ interface RecorderConfig {
   - **判据只收带真实路径的形态**，对散文与示例零误报：波浪号家目录简写（`~/`，§2/§8 规定的
     正规表达，本身不含用户名）与用户目录环境变量名都**不查**。会长期假红的规则最终会被绕过，
     那比少一条规则更危险。
-- 构建中间目录 `.client-build-tmp/` 与测试沙箱 `tests/.tmp/` 都不入库（`.gitignore`）。
+- 构建中间目录 `.client-build-tmp/` 不入库；测试沙箱默认建在系统临时目录（不落在仓库里），不依赖 `tests/.tmp/`。
