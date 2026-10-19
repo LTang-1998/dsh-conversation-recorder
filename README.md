@@ -19,7 +19,7 @@ turns/0002.md
 ## 安装
 
 ```
-dsh plugin --profile <你的 profile> add github:LTang-1998/dsh-conversation-recorder#v1.0.0
+dsh plugin --profile <你的 profile> add github:LTang-1998/dsh-conversation-recorder#v2.0.0
 ```
 
 **装完即可用，不需要构建授权**：`lib/`（预构建产物 + 类型声明）已随仓库提交，`cordis.patch.yml`
@@ -207,8 +207,7 @@ CI 按 **node 22 与 node 24** 各跑一遍上面的门禁（`.github/workflows/
     ├── spec-selfcheck.ts    # SPEC 结构自检
     ├── probe-real-settings.ts   # 只读探针：本机声明的 root → Config → 落点
     ├── probe-client-bundle.ts   # 只读探针：lib/client.js 自注册/物化/槽注册链
-    ├── client-bundle.ts     # 上面那个探针的加载链替身（真代码，可复用）
-    └── .gitignore           # 忽略 .tmp/
+    └── client-bundle.ts     # 上面那个探针的加载链替身（真代码，可复用）
 ```
 
 ## License
